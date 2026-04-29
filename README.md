@@ -1,6 +1,6 @@
 # nordify
 
-Convert any image to the [Nord colour palette](https://www.nordtheme.com/). Colour snapping and dithering operate in the perceptually-uniform [Oklab](https://bottosson.github.io/posts/oklab/) colour space; palette mixing snaps colours in linear RGB using a convex-hull model.
+Convert any image to the [Nord colour palette](https://www.nordtheme.com/). Colour snapping and dithering operate in the perceptually-uniform [Oklab](https://bottosson.github.io/posts/oklab/) colour space; palette mixing uses a convex-hull model in linear RGB with Oklab-based optimisation targets.
 
 ## Installation
 
