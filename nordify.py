@@ -483,8 +483,8 @@ def main():
                         help="Palette mixing gamut mapping (ignores --dither)")
     parser.add_argument("--wallpaper", action="store_true",
                         help="Crop to 16:9 and apply gradient blur at edges")
-    parser.add_argument("--margin", type=int, default=200, metavar="PX",
-                        help="Blur ramp width in pixels for --wallpaper (default: 200)")
+    parser.add_argument("--margin", type=float, default=10.0, metavar="PCT",
+                        help="Blur ramp width as %% of image height for --wallpaper (default: 10)")
     args = parser.parse_args()
 
     image = cv2.imread(args.input)
@@ -502,7 +502,8 @@ def main():
         result = convert(image, palette, dither=args.dither)
 
     if args.wallpaper:
-        result = _edge_blur(result, margin=args.margin)
+        margin_px = max(1, round(args.margin / 100.0 * result.shape[0]))
+        result = _edge_blur(result, margin=margin_px)
 
     ok = cv2.imwrite(args.output, result)
     if not ok:

@@ -19,7 +19,7 @@ pip install mlx   # Apple Silicon (required for --mix)
 ## Usage
 
 ```
-python3 nordify.py <input> -o <output> [--dither fs] [--mix] [--wallpaper] [--margin PX]
+python3 nordify.py <input> -o <output> [--dither fs] [--mix] [--wallpaper] [--margin PCT]
 ```
 
 | Flag | Description |
@@ -27,7 +27,7 @@ python3 nordify.py <input> -o <output> [--dither fs] [--mix] [--wallpaper] [--ma
 | `--dither fs` | Floyd-Steinberg dithering with blue-noise seeding |
 | `--mix` | Palette mixing gamut mapping |
 | `--wallpaper` | Crop to 16:9 and apply gradient blur at edges |
-| `--margin PX` | Blur ramp width in pixels for `--wallpaper` (default: 200) |
+| `--margin PCT` | Blur ramp width as % of image height for `--wallpaper` (default: 10) |
 
 ### Examples
 
@@ -45,7 +45,7 @@ python3 nordify.py photo.jpg -o photo_nord.png --mix
 python3 nordify.py photo.jpg -o wallpaper.png --mix --wallpaper
 
 # Wallpaper with wider blur ramp
-python3 nordify.py photo.jpg -o wallpaper.png --mix --wallpaper --margin 350
+python3 nordify.py photo.jpg -o wallpaper.png --mix --wallpaper --margin 15
 ```
 
 ## Samples
@@ -87,7 +87,7 @@ For a more detailed discussion of the algorithms and their artistic rationale, s
 
 ### Wallpaper preparation (`--wallpaper`)
 
-Center-crops the image to 16:9, then applies a [smoothstep](https://en.wikipedia.org/wiki/Smoothstep) gradient blur over a fixed-pixel margin on all four edges. The blurred region accommodates a menu bar (top) and dock (bottom) without visual clash. Blur strength is controlled via `--margin`.
+Center-crops the image to 16:9, then applies a [smoothstep](https://en.wikipedia.org/wiki/Smoothstep) gradient blur over a margin on all four edges. The margin is specified as a percentage of image height (default 10%), sized to accommodate a menu bar (top) and dock (bottom) without visual clash. Blur strength is controlled via `--margin`.
 
 ## Nord Palette
 
