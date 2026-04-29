@@ -1,0 +1,5 @@
+numpy
+opencv-python-headless
+
+# Optional — required for --mix (Apple Silicon)
+# mlx
