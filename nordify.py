@@ -450,23 +450,31 @@ def _crop_16_9(image):
         return image[y0:y0 + new_h, :]
 
 
-def _edge_blur(image, margin=200):
-    """Gradient blur toward all four edges for wallpaper use.
+def _edge_blur(image, sigma, edges=('top', 'bottom')):
+    """Gradient blur toward selected edges for wallpaper use.
 
-    margin : width of the blur ramp in pixels, identical on all four sides.
-             Gaussian sigma is margin / 3.
+    sigma  : Gaussian standard deviation in pixels.
+    edges  : iterable of 'top', 'bottom', 'left', 'right'.
+             Ramp extends 3*sigma pixels inward from each selected edge.
     """
     h, w = image.shape[:2]
-    sigma = margin / 3.0
+    ramp_width = max(1, round(3 * sigma))
     ksize = int(sigma * 6) | 1  # nearest odd integer ≥ 6σ
     blurred = cv2.GaussianBlur(image, (ksize, ksize), sigma)
 
-    def ramp(n):
+    def ramp(n, from_end=False):
         t = np.arange(n, dtype=np.float32)
-        d = np.clip(np.minimum(t, (n - 1) - t) / margin, 0.0, 1.0)
-        return 1.0 - d * d * (3.0 - 2.0 * d)  # smoothstep: 1 at edge, 0 in centre
+        if from_end:
+            t = (n - 1) - t
+        d = np.clip(t / ramp_width, 0.0, 1.0)
+        return 1.0 - d * d * (3.0 - 2.0 * d)  # smoothstep: 1 at edge, 0 beyond ramp
 
-    mask = np.maximum(ramp(h)[:, None, None], ramp(w)[None, :, None])
+    mask = np.zeros((h, w, 1), dtype=np.float32)
+    if 'top'    in edges: mask = np.maximum(mask, ramp(h)[:, None, None])
+    if 'bottom' in edges: mask = np.maximum(mask, ramp(h, from_end=True)[:, None, None])
+    if 'left'   in edges: mask = np.maximum(mask, ramp(w)[None, :, None])
+    if 'right'  in edges: mask = np.maximum(mask, ramp(w, from_end=True)[None, :, None])
+
     result = (1.0 - mask) * image + mask * blurred
     return np.clip(result, 0, 255).astype(np.uint8)
 
@@ -483,8 +491,10 @@ def main():
                         help="Palette mixing gamut mapping (ignores --dither)")
     parser.add_argument("--wallpaper", action="store_true",
                         help="Crop to 16:9 and apply gradient blur at edges")
-    parser.add_argument("--margin", type=float, default=10.0, metavar="PCT",
-                        help="Blur ramp width as %% of image height for --wallpaper (default: 10)")
+    parser.add_argument("--blur", type=float, default=10.0, metavar="PCT",
+                        help="Gaussian blur sigma as %% of image height for --wallpaper (default: 10)")
+    parser.add_argument("--edges", default="top,bottom", metavar="EDGES",
+                        help="Comma-separated edges to blur for --wallpaper: top,bottom,left,right (default: top,bottom)")
     args = parser.parse_args()
 
     image = cv2.imread(args.input)
@@ -502,8 +512,9 @@ def main():
         result = convert(image, palette, dither=args.dither)
 
     if args.wallpaper:
-        margin_px = max(1, round(args.margin / 100.0 * result.shape[0]))
-        result = _edge_blur(result, margin=margin_px)
+        sigma_px = max(1, round(args.blur / 100.0 * result.shape[0]))
+        edges = tuple(e.strip() for e in args.edges.split(','))
+        result = _edge_blur(result, sigma=sigma_px, edges=edges)
 
     ok = cv2.imwrite(args.output, result)
     if not ok:

@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 source venv/bin/activate
-python3 nordify.py <input> -o <output> [--dither fs] [--mix] [--wallpaper [--margin PX]]
+python3 nordify.py <input> -o <output> [--dither fs] [--mix] [--wallpaper [--blur PCT]]
 ```
 
 Core dependencies: `numpy`, `opencv-python-headless` (in `venv/`).  
@@ -67,4 +67,4 @@ After every Adam step, `snap()` projects the colour onto the RGB convex hull via
 
 **`_crop_16_9(image)`** — center-crops to 16:9 aspect ratio. Applied before nordification so fewer pixels are processed.
 
-**`_edge_blur(image, margin=200)`** — blends a Gaussian-blurred version at the edges using a smoothstep ramp of width `margin` pixels (identical on all four sides). Sigma = `margin / 3`. Applied after nordification. Controlled via `--margin PX`.
+**`_edge_blur(image, sigma, edges)`** — blends a Gaussian-blurred version toward selected edges using a smoothstep ramp of width `3 × sigma` pixels. `edges` is a tuple of `'top'`, `'bottom'`, `'left'`, `'right'`; defaults to `('top', 'bottom')`. Controlled via `--blur PCT` and `--edges EDGES`.
