@@ -50,7 +50,7 @@ python3 nordify.py photo.jpg -o wallpaper.png --mix --wallpaper --margin 15
 
 ## Samples
 
-Original photo by [v2osk](https://unsplash.com/photos/1Z2niiBPg5A) on Unsplash.
+Original photo by [Philippe Gauthier](https://unsplash.com/photos/orange-fruits-under-blue-sky-during-daytime-eaOjEz8746k) on Unsplash.
 
 | | |
 |---|---|
