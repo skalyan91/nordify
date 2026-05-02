@@ -65,6 +65,6 @@ After every Adam step, `snap()` projects the colour onto the RGB convex hull via
 
 ### Wallpaper preparation (`--wallpaper`)
 
-**`_crop_16_9(image)`** — center-crops to 16:9 aspect ratio. Applied before nordification so fewer pixels are processed.
+**`_crop_to_aspect(image, ratio_w, ratio_h, align='center')`** — crops to the given aspect ratio. `align` is `'left'`/`'center'`/`'right'` when width is cropped, `'top'`/`'center'`/`'bottom'` when height is cropped. Applied before nordification so fewer pixels are processed.
 
 **`_edge_blur(image, sigma, edges)`** — blends a Gaussian-blurred version toward selected edges using a smoothstep ramp of width `3 × sigma` pixels. `edges` is a tuple of `'top'`, `'bottom'`, `'left'`, `'right'`; defaults to `('top', 'bottom')`. Controlled via `--blur PCT` and `--edges EDGES`.

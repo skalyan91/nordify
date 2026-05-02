@@ -19,14 +19,16 @@ pip install mlx   # Apple Silicon (required for --mix)
 ## Usage
 
 ```
-python3 nordify.py <input> -o <output> [--dither fs] [--mix] [--wallpaper] [--blur PCT] [--edges EDGES]
+python3 nordify.py <input> -o <output> [--dither fs] [--mix] [--wallpaper] [--aspect W:H] [--align ALIGN] [--blur PCT] [--edges EDGES]
 ```
 
 | Flag | Description |
 |------|-------------|
 | `--dither fs` | Floyd-Steinberg dithering with blue-noise seeding |
 | `--mix` | Palette mixing gamut mapping |
-| `--wallpaper` | Crop to 16:9 and apply gradient blur at edges |
+| `--wallpaper` | Crop to target aspect ratio and apply gradient blur at edges |
+| `--aspect W:H` | Crop aspect ratio for `--wallpaper` (default: `16:9`) |
+| `--align ALIGN` | Crop alignment: `left`, `center`, `right`, `top`, `bottom` (default: `center`) |
 | `--blur PCT` | Gaussian blur sigma as % of image height for `--wallpaper` (default: 10) |
 | `--edges EDGES` | Comma-separated edges to blur: `top,bottom,left,right` (default: `top,bottom`) |
 
@@ -44,6 +46,9 @@ python3 nordify.py photo.jpg -o photo_nord.png --mix
 
 # Wallpaper (16:9 crop + edge blur, combinable with any mode)
 python3 nordify.py photo.jpg -o wallpaper.png --mix --wallpaper
+
+# Wallpaper for a 3:2 display, keeping the right side of the image
+python3 nordify.py photo.jpg -o wallpaper.png --mix --wallpaper --aspect 3:2 --align right
 
 # Wallpaper with stronger blur
 python3 nordify.py photo.jpg -o wallpaper.png --mix --wallpaper --blur 15
@@ -88,7 +93,7 @@ For a more detailed discussion of the algorithms and their artistic rationale, s
 
 ### Wallpaper preparation (`--wallpaper`)
 
-Center-crops the image to 16:9, then blends in a Gaussian-blurred version toward selected edges using a [smoothstep](https://en.wikipedia.org/wiki/Smoothstep) ramp. `--blur` sets the Gaussian sigma as a percentage of image height (default 10%); the blend ramp extends over 3× that distance inward from each edge. `--edges` selects which edges are blurred (default `top,bottom`, to accommodate a menu bar and dock).
+Crops the image to a target aspect ratio (default `16:9`), then blends in a Gaussian-blurred version toward selected edges using a [smoothstep](https://en.wikipedia.org/wiki/Smoothstep) ramp. `--aspect W:H` sets the ratio; `--align` controls which part of the image is kept (`left`/`center`/`right` when cropping width, `top`/`center`/`bottom` when cropping height). `--blur` sets the Gaussian sigma as a percentage of image height (default 10%); the blend ramp extends over 3× that distance inward from each edge. `--edges` selects which edges are blurred (default `top,bottom`, to accommodate a menu bar and dock).
 
 ## Nord Palette
 

@@ -437,16 +437,22 @@ def convert(image, palette, dither=None):
     return (_oklab_to_bgr(out_lab) * 255.0).astype(np.uint8)
 
 
-def _crop_16_9(image):
-    """Center-crop to 16:9 aspect ratio."""
+def _crop_to_aspect(image, ratio_w, ratio_h, align='center'):
+    """Crop to the given aspect ratio.
+
+    When width is cropped, align is 'left'/'center'/'right'.
+    When height is cropped, align is 'top'/'center'/'bottom'.
+    """
     h, w = image.shape[:2]
-    if w * 9 > h * 16:
-        new_w = h * 16 // 9
-        x0 = (w - new_w) // 2
+    if w * ratio_h > h * ratio_w:   # image wider than target: crop width
+        new_w = h * ratio_w // ratio_h
+        excess = w - new_w
+        x0 = 0 if align == 'left' else excess if align == 'right' else excess // 2
         return image[:, x0:x0 + new_w]
-    else:
-        new_h = w * 9 // 16
-        y0 = (h - new_h) // 2
+    else:                            # image taller than target: crop height
+        new_h = w * ratio_h // ratio_w
+        excess = h - new_h
+        y0 = 0 if align == 'top' else excess if align == 'bottom' else excess // 2
         return image[y0:y0 + new_h, :]
 
 
@@ -490,7 +496,12 @@ def main():
     parser.add_argument("--mix", action="store_true",
                         help="Palette mixing gamut mapping (ignores --dither)")
     parser.add_argument("--wallpaper", action="store_true",
-                        help="Crop to 16:9 and apply gradient blur at edges")
+                        help="Crop to target aspect ratio and apply gradient blur at edges")
+    parser.add_argument("--aspect", default="16:9", metavar="W:H",
+                        help="Crop aspect ratio for --wallpaper (default: 16:9)")
+    parser.add_argument("--align", default="center",
+                        choices=["left", "center", "right", "top", "bottom"],
+                        help="Crop alignment for --wallpaper (default: center)")
     parser.add_argument("--blur", type=float, default=10.0, metavar="PCT",
                         help="Gaussian blur sigma as %% of image height for --wallpaper (default: 10)")
     parser.add_argument("--edges", default="top,bottom", metavar="EDGES",
@@ -503,7 +514,8 @@ def main():
         sys.exit(1)
 
     if args.wallpaper:
-        image = _crop_16_9(image)
+        ratio_w, ratio_h = (int(x) for x in args.aspect.split(':'))
+        image = _crop_to_aspect(image, ratio_w, ratio_h, align=args.align)
 
     if args.mix:
         result = mix_convert(image)
