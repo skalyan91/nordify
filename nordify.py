@@ -456,10 +456,8 @@ def _crop_to_aspect(image, ratio_w, ratio_h, align='center'):
         return image[y0:y0 + new_h, :]
 
 
-_N_SCALE_LEVELS = 50   # intermediate blur levels (0 = sharp, N = full blur)
-_BLUR_CURVE_K   = 10.0  # exponential mapping k: level = expm1(k·mask)/expm1(k) · N
-# Sigma levels use the quantile distribution for density ∝ exp(k·mask):
-#   σᵢ = σ_max · (√(1 + expm1(2k)·i/N) − 1) / expm1(k)
+_N_SCALE_LEVELS  = 50   # intermediate blur levels (0 = sharp, N = full blur)
+_BLUR_MASK_POWER = 8.0  # mask→level mapping: level = mask^p · N
 
 
 def _gaussian_blur_mlx(img_lin, sigma):
@@ -490,17 +488,17 @@ def _gaussian_blur_mlx(img_lin, sigma):
     return np.array(t[0])  # (H, W, 3)
 
 
-def _edge_blur(image, sigma, edges=('top', 'bottom')):
+def _edge_blur(image, sigma, ramp_px, edges=('top', 'bottom')):
     """Gradient blur toward selected edges for wallpaper use.
 
-    Builds _N_SCALE_LEVELS blur levels with sigma values at the quantile
-    distribution for density ∝ exp(k·mask): σᵢ=σ_max·(√(1+expm1(2k)·i/N)−1)/expm1(k).
-    Mask→level mapping: level=expm1(k·mask)/expm1(k)·N. Levels are densest
-    near σ_max where the mapping changes fastest, minimising interpolation error.
+    Builds _N_SCALE_LEVELS evenly-spaced blur levels (σᵢ = σ_max·i/N).
+    Mask→level mapping: level = mask^p·N (_BLUR_MASK_POWER=2) so
+    sigma_eff(mask) = sigma_max·mask^p. ramp_px and sigma are independent:
+    ramp_px sets the spatial extent of the blend, sigma sets the max blur.
     Convolutions on GPU via MLX when available, else cv2. All in linear light.
     """
     h, w = image.shape[:2]
-    ramp_width = max(1, round(3 * sigma))
+    ramp_width = max(1, ramp_px)
 
     img_lin = _srgb_to_linear(image.astype(np.float32) / 255.0)
 
@@ -513,11 +511,7 @@ def _edge_blur(image, sigma, edges=('top', 'bottom')):
                                            borderType=cv2.BORDER_REFLECT_101)
 
     N = _N_SCALE_LEVELS
-    k = _BLUR_CURVE_K
-    levels = [img_lin] + [
-        _blur(sigma * (np.sqrt(1.0 + np.expm1(2*k) * (i+1)/N) - 1.0) / np.expm1(k))
-        for i in range(N)
-    ]
+    levels = [img_lin] + [_blur(sigma * (i + 1) / N) for i in range(N)]
 
     def ramp(n, from_end=False):
         t = np.arange(n, dtype=np.float32)
@@ -532,8 +526,8 @@ def _edge_blur(image, sigma, edges=('top', 'bottom')):
     if 'left'   in edges: mask = np.maximum(mask, ramp(w)[None, :, None])
     if 'right'  in edges: mask = np.maximum(mask, ramp(w, from_end=True)[None, :, None])
 
-    levels_arr = np.stack(levels, axis=0)                                              # (N+1, H, W, 3)
-    level      = np.clip(np.expm1(k * mask) / np.expm1(k) * N, 0.0, float(N))      # (H, W, 1)
+    levels_arr = np.stack(levels, axis=0)                                    # (N+1, H, W, 3)
+    level      = np.clip(mask ** _BLUR_MASK_POWER * N, 0.0, float(N))  # (H, W, 1)
     level_lo   = np.clip(np.floor(level).astype(np.int32), 0, N - 1)
     alpha      = level - level_lo                      # (H, W, 1) fractional part
 
@@ -565,8 +559,10 @@ def main():
     parser.add_argument("--align", default="center",
                         choices=["left", "center", "right", "top", "bottom"],
                         help="Crop alignment for --wallpaper (default: center)")
-    parser.add_argument("--blur", type=float, default=10.0, metavar="PCT",
-                        help="Gaussian blur sigma as %% of image height for --wallpaper (default: 10)")
+    parser.add_argument("--blur", type=float, default=2.0, metavar="PCT",
+                        help="Max Gaussian blur sigma as %% of image height for --wallpaper (default: 5)")
+    parser.add_argument("--ramp", type=float, default=50.0, metavar="PCT",
+                        help="Blur ramp width as %% of image height for --wallpaper (default: 10)")
     parser.add_argument("--edges", default="top,bottom", metavar="EDGES",
                         help="Comma-separated edges to blur for --wallpaper: top,bottom,left,right (default: top,bottom)")
     args = parser.parse_args()
@@ -587,9 +583,11 @@ def main():
         result = convert(image, palette, dither=args.dither)
 
     if args.wallpaper:
-        sigma_px = max(1, round(args.blur / 100.0 * result.shape[0]))
+        h = result.shape[0]
+        sigma_px = max(1, round(args.blur / 100.0 * h))
+        ramp_px  = max(1, round(args.ramp / 100.0 * h))
         edges = tuple(e.strip() for e in args.edges.split(','))
-        result = _edge_blur(result, sigma=sigma_px, edges=edges)
+        result = _edge_blur(result, sigma=sigma_px, ramp_px=ramp_px, edges=edges)
 
     ok = cv2.imwrite(args.output, result)
     if not ok:
