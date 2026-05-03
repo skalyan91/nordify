@@ -456,27 +456,32 @@ def _crop_to_aspect(image, ratio_w, ratio_h, align='center'):
         return image[y0:y0 + new_h, :]
 
 
-_N_SCALE_LEVELS = 3  # intermediate blur levels (0 = sharp, N = full blur)
+_N_SCALE_LEVELS = 6   # intermediate blur levels (0 = sharp, N = full blur)
+_BLUR_EXPONENT   = 2  # sigma grows as mask^_BLUR_EXPONENT — smoother onset near centre
 
 
 def _gaussian_blur_mlx(img_lin, sigma):
-    """Separable Gaussian blur on GPU via MLX depthwise convolution."""
+    """Separable Gaussian blur on GPU via MLX depthwise convolution.
+
+    Pre-pads with NumPy reflect mode so boundary pixels are mirrored rather
+    than treated as black; the paired convolutions consume that padding exactly.
+    """
     import mlx.core as mx
     radius = round(3 * sigma)
     x = np.arange(-radius, radius + 1, dtype=np.float32)
     k = np.exp(-0.5 * (x / sigma) ** 2)
     k = (k / k.sum()).astype(np.float32)
 
-    t = mx.array(img_lin[None])  # (1, H, W, 3)
+    # Reflect-pad in NumPy (mirrors edge content, not black) then pass to MLX
+    padded = np.pad(img_lin, [(radius, radius), (radius, radius), (0, 0)], mode='reflect')
+    t = mx.array(padded[None])  # (1, H+2r, W+2r, 3)
 
-    # Horizontal depthwise pass: weight (3, 1, ksize, 1), groups=3
+    # Horizontal depthwise: (1, H+2r, W+2r, 3) → (1, H+2r, W, 3)
     kh = mx.array(np.tile(k[None, None, :, None], (3, 1, 1, 1)))
-    t = mx.pad(t, [(0, 0), (0, 0), (radius, radius), (0, 0)])
     t = mx.conv2d(t, kh, groups=3)
 
-    # Vertical depthwise pass: weight (3, ksize, 1, 1), groups=3
+    # Vertical depthwise: (1, H+2r, W, 3) → (1, H, W, 3)
     kv = mx.array(np.tile(k[None, :, None, None], (3, 1, 1, 1)))
-    t = mx.pad(t, [(0, 0), (radius, radius), (0, 0), (0, 0)])
     t = mx.conv2d(t, kv, groups=3)
 
     mx.eval(t)
@@ -501,7 +506,9 @@ def _edge_blur(image, sigma, edges=('top', 'bottom')):
         import mlx.core  # noqa: F401
         _blur = lambda s: _gaussian_blur_mlx(img_lin, s)
     except ImportError:
-        _blur = lambda s: cv2.GaussianBlur(img_lin, (int(s * 6) | 1, int(s * 6) | 1), s)
+        # BORDER_REFLECT_101: mirrors edge content (default, but stated explicitly)
+        _blur = lambda s: cv2.GaussianBlur(img_lin, (int(s * 6) | 1, int(s * 6) | 1), s,
+                                           borderType=cv2.BORDER_REFLECT_101)
 
     N = _N_SCALE_LEVELS
     levels = [img_lin] + [_blur(sigma * (i + 1) / N) for i in range(N)]
@@ -519,10 +526,10 @@ def _edge_blur(image, sigma, edges=('top', 'bottom')):
     if 'left'   in edges: mask = np.maximum(mask, ramp(w)[None, :, None])
     if 'right'  in edges: mask = np.maximum(mask, ramp(w, from_end=True)[None, :, None])
 
-    # Map mask ∈ [0, 1] to a continuous level index ∈ [0, N], then interpolate
-    # between the two bracketing blur levels — no ghosting from sharp/blurred mix.
-    levels_arr = np.stack(levels, axis=0)              # (N+1, H, W, 3)
-    level      = np.clip(mask * N, 0.0, float(N))     # (H, W, 1)
+    # Quadratic mapping: level grows as mask^_BLUR_EXPONENT so sigma onset is
+    # gradual near the centre and steeper near the edge.
+    levels_arr = np.stack(levels, axis=0)                              # (N+1, H, W, 3)
+    level      = np.clip(mask ** _BLUR_EXPONENT * N, 0.0, float(N))  # (H, W, 1)
     level_lo   = np.clip(np.floor(level).astype(np.int32), 0, N - 1)
     alpha      = level - level_lo                      # (H, W, 1) fractional part
 
