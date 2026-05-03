@@ -457,7 +457,7 @@ def _crop_to_aspect(image, ratio_w, ratio_h, align='center'):
 
 
 _N_SCALE_LEVELS = 6    # intermediate blur levels (0 = sharp, N = full blur)
-_BLUR_CURVE_K   = 5.0  # exponential mapping: sigma ∝ (exp(k·mask)−1)/(exp(k)−1)
+_BLUR_CURVE_K   = 10.0  # exponential mapping: sigma ∝ (exp(k·mask)−1)/(exp(k)−1)
 
 
 def _gaussian_blur_mlx(img_lin, sigma):
