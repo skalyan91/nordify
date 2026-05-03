@@ -456,11 +456,10 @@ def _crop_to_aspect(image, ratio_w, ratio_h, align='center'):
         return image[y0:y0 + new_h, :]
 
 
-_N_SCALE_LEVELS  = 20  # intermediate blur levels (0 = sharp, N = full blur)
-_BLUR_MAP_EXP    = 4  # mask→level mapping exponent p: level = mask^p · N
-# Sigma levels are spaced as σᵢ = σ_max·(i/N)^(p/(2p−1)), the quantile distribution
-# whose density is proportional to |f'(mask)| = p·mask^(p-1) — so levels are denser
-# where the mapping changes fastest (near the edge), minimising interpolation error.
+_N_SCALE_LEVELS = 50   # intermediate blur levels (0 = sharp, N = full blur)
+_BLUR_CURVE_K   = 5.0  # exponential mapping k: level = expm1(k·mask)/expm1(k) · N
+# Sigma levels use the quantile distribution for density ∝ exp(k·mask):
+#   σᵢ = σ_max · (√(1 + expm1(2k)·i/N) − 1) / expm1(k)
 
 
 def _gaussian_blur_mlx(img_lin, sigma):
@@ -494,12 +493,11 @@ def _gaussian_blur_mlx(img_lin, sigma):
 def _edge_blur(image, sigma, edges=('top', 'bottom')):
     """Gradient blur toward selected edges for wallpaper use.
 
-    Builds _N_SCALE_LEVELS blur levels with sigma values spaced as
-    σ_max·(i/N)^(p/(2p−1)) — the quantile distribution proportional to
-    |f'(mask)| for the mapping f(mask)=mask^p, so levels are densest where
-    the mapping changes fastest (near the edge). The mask→level mapping is
-    level=mask^p·N (quadratic by default). Convolutions run on GPU via MLX
-    when available, otherwise on CPU via cv2. All in linear light.
+    Builds _N_SCALE_LEVELS blur levels with sigma values at the quantile
+    distribution for density ∝ exp(k·mask): σᵢ=σ_max·(√(1+expm1(2k)·i/N)−1)/expm1(k).
+    Mask→level mapping: level=expm1(k·mask)/expm1(k)·N. Levels are densest
+    near σ_max where the mapping changes fastest, minimising interpolation error.
+    Convolutions on GPU via MLX when available, else cv2. All in linear light.
     """
     h, w = image.shape[:2]
     ramp_width = max(1, round(3 * sigma))
@@ -515,9 +513,11 @@ def _edge_blur(image, sigma, edges=('top', 'bottom')):
                                            borderType=cv2.BORDER_REFLECT_101)
 
     N = _N_SCALE_LEVELS
-    p = _BLUR_MAP_EXP
-    sigma_exp = p / (2 * p - 1)   # = 2/3 for p=2
-    levels = [img_lin] + [_blur(sigma * ((i + 1) / N) ** sigma_exp) for i in range(N)]
+    k = _BLUR_CURVE_K
+    levels = [img_lin] + [
+        _blur(sigma * (np.sqrt(1.0 + np.expm1(2*k) * (i+1)/N) - 1.0) / np.expm1(k))
+        for i in range(N)
+    ]
 
     def ramp(n, from_end=False):
         t = np.arange(n, dtype=np.float32)
@@ -532,8 +532,8 @@ def _edge_blur(image, sigma, edges=('top', 'bottom')):
     if 'left'   in edges: mask = np.maximum(mask, ramp(w)[None, :, None])
     if 'right'  in edges: mask = np.maximum(mask, ramp(w, from_end=True)[None, :, None])
 
-    levels_arr = np.stack(levels, axis=0)                                    # (N+1, H, W, 3)
-    level      = np.clip(mask ** p * N, 0.0, float(N))                     # (H, W, 1)
+    levels_arr = np.stack(levels, axis=0)                                              # (N+1, H, W, 3)
+    level      = np.clip(np.expm1(k * mask) / np.expm1(k) * N, 0.0, float(N))      # (H, W, 1)
     level_lo   = np.clip(np.floor(level).astype(np.int32), 0, N - 1)
     alpha      = level - level_lo                      # (H, W, 1) fractional part
 
