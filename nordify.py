@@ -462,11 +462,15 @@ def _edge_blur(image, sigma, edges=('top', 'bottom')):
     sigma  : Gaussian standard deviation in pixels.
     edges  : iterable of 'top', 'bottom', 'left', 'right'.
              Ramp extends 3*sigma pixels inward from each selected edge.
+    Blur and blending are performed in linear light (sRGB gamma removed
+    before, restored after) for physically correct results.
     """
     h, w = image.shape[:2]
     ramp_width = max(1, round(3 * sigma))
     ksize = int(sigma * 6) | 1  # nearest odd integer ≥ 6σ
-    blurred = cv2.GaussianBlur(image, (ksize, ksize), sigma)
+
+    img_lin = _srgb_to_linear(image.astype(np.float32) / 255.0)
+    blurred_lin = cv2.GaussianBlur(img_lin, (ksize, ksize), sigma)
 
     def ramp(n, from_end=False):
         t = np.arange(n, dtype=np.float32)
@@ -481,8 +485,8 @@ def _edge_blur(image, sigma, edges=('top', 'bottom')):
     if 'left'   in edges: mask = np.maximum(mask, ramp(w)[None, :, None])
     if 'right'  in edges: mask = np.maximum(mask, ramp(w, from_end=True)[None, :, None])
 
-    result = (1.0 - mask) * image + mask * blurred
-    return np.clip(result, 0, 255).astype(np.uint8)
+    blended_lin = (1.0 - mask) * img_lin + mask * blurred_lin
+    return np.clip(_linear_to_srgb(blended_lin) * 255.0, 0, 255).astype(np.uint8)
 
 
 def main():
