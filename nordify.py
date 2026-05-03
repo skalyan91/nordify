@@ -457,7 +457,7 @@ def _crop_to_aspect(image, ratio_w, ratio_h, align='center'):
 
 
 _N_SCALE_LEVELS = 50   # intermediate blur levels (0 = sharp, N = full blur)
-_BLUR_CURVE_K   = 5.0  # exponential mapping k: level = expm1(k·mask)/expm1(k) · N
+_BLUR_CURVE_K   = 10.0  # exponential mapping k: level = expm1(k·mask)/expm1(k) · N
 # Sigma levels use the quantile distribution for density ∝ exp(k·mask):
 #   σᵢ = σ_max · (√(1 + expm1(2k)·i/N) − 1) / expm1(k)
 
