@@ -456,7 +456,7 @@ def _crop_to_aspect(image, ratio_w, ratio_h, align='center'):
         return image[y0:y0 + new_h, :]
 
 
-_N_SCALE_LEVELS  = 6  # intermediate blur levels (0 = sharp, N = full blur)
+_N_SCALE_LEVELS  = 20  # intermediate blur levels (0 = sharp, N = full blur)
 _BLUR_MAP_EXP    = 2  # mask→level mapping exponent p: level = mask^p · N
 # Sigma levels are spaced as σᵢ = σ_max·(i/N)^(p/(2p−1)), the quantile distribution
 # whose density is proportional to |f'(mask)| = p·mask^(p-1) — so levels are denser
