@@ -456,8 +456,8 @@ def _crop_to_aspect(image, ratio_w, ratio_h, align='center'):
         return image[y0:y0 + new_h, :]
 
 
-_N_SCALE_LEVELS = 6   # intermediate blur levels (0 = sharp, N = full blur)
-_BLUR_EXPONENT   = 2  # sigma grows as mask^_BLUR_EXPONENT — smoother onset near centre
+_N_SCALE_LEVELS = 6    # intermediate blur levels (0 = sharp, N = full blur)
+_BLUR_CURVE_K   = 5.0  # exponential mapping: sigma ∝ (exp(k·mask)−1)/(exp(k)−1)
 
 
 def _gaussian_blur_mlx(img_lin, sigma):
@@ -526,10 +526,11 @@ def _edge_blur(image, sigma, edges=('top', 'bottom')):
     if 'left'   in edges: mask = np.maximum(mask, ramp(w)[None, :, None])
     if 'right'  in edges: mask = np.maximum(mask, ramp(w, from_end=True)[None, :, None])
 
-    # Quadratic mapping: level grows as mask^_BLUR_EXPONENT so sigma onset is
-    # gradual near the centre and steeper near the edge.
-    levels_arr = np.stack(levels, axis=0)                              # (N+1, H, W, 3)
-    level      = np.clip(mask ** _BLUR_EXPONENT * N, 0.0, float(N))  # (H, W, 1)
+    # Exponential mapping: (exp(k·mask)−1)/(exp(k)−1) keeps sigma near-zero
+    # across most of the ramp, rising steeply only close to the edge.
+    k          = _BLUR_CURVE_K
+    levels_arr = np.stack(levels, axis=0)                                               # (N+1, H, W, 3)
+    level      = np.clip((np.expm1(k * mask) / np.expm1(k)) * N, 0.0, float(N))      # (H, W, 1)
     level_lo   = np.clip(np.floor(level).astype(np.int32), 0, N - 1)
     alpha      = level - level_lo                      # (H, W, 1) fractional part
 
