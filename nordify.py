@@ -456,21 +456,55 @@ def _crop_to_aspect(image, ratio_w, ratio_h, align='center'):
         return image[y0:y0 + new_h, :]
 
 
+_N_SCALE_LEVELS = 3  # intermediate blur levels (0 = sharp, N = full blur)
+
+
+def _gaussian_blur_mlx(img_lin, sigma):
+    """Separable Gaussian blur on GPU via MLX depthwise convolution."""
+    import mlx.core as mx
+    radius = round(3 * sigma)
+    x = np.arange(-radius, radius + 1, dtype=np.float32)
+    k = np.exp(-0.5 * (x / sigma) ** 2)
+    k = (k / k.sum()).astype(np.float32)
+
+    t = mx.array(img_lin[None])  # (1, H, W, 3)
+
+    # Horizontal depthwise pass: weight (3, 1, ksize, 1), groups=3
+    kh = mx.array(np.tile(k[None, None, :, None], (3, 1, 1, 1)))
+    t = mx.pad(t, [(0, 0), (0, 0), (radius, radius), (0, 0)])
+    t = mx.conv2d(t, kh, groups=3)
+
+    # Vertical depthwise pass: weight (3, ksize, 1, 1), groups=3
+    kv = mx.array(np.tile(k[None, :, None, None], (3, 1, 1, 1)))
+    t = mx.pad(t, [(0, 0), (radius, radius), (0, 0), (0, 0)])
+    t = mx.conv2d(t, kv, groups=3)
+
+    mx.eval(t)
+    return np.array(t[0])  # (H, W, 3)
+
+
 def _edge_blur(image, sigma, edges=('top', 'bottom')):
     """Gradient blur toward selected edges for wallpaper use.
 
-    sigma  : Gaussian standard deviation in pixels.
-    edges  : iterable of 'top', 'bottom', 'left', 'right'.
-             Ramp extends 3*sigma pixels inward from each selected edge.
-    Blur and blending are performed in linear light (sRGB gamma removed
-    before, restored after) for physically correct results.
+    Builds _N_SCALE_LEVELS blur levels at sigma/N, 2*sigma/N, …, sigma and
+    interpolates across them based on distance from each edge. This avoids
+    the ghosting artifact of blending sharp with a single fully-blurred image.
+    Convolutions run on GPU via MLX when available, otherwise on CPU via cv2.
+    All operations in linear light; sRGB gamma removed before, restored after.
     """
     h, w = image.shape[:2]
     ramp_width = max(1, round(3 * sigma))
-    ksize = int(sigma * 6) | 1  # nearest odd integer ≥ 6σ
 
     img_lin = _srgb_to_linear(image.astype(np.float32) / 255.0)
-    blurred_lin = cv2.GaussianBlur(img_lin, (ksize, ksize), sigma)
+
+    try:
+        import mlx.core  # noqa: F401
+        _blur = lambda s: _gaussian_blur_mlx(img_lin, s)
+    except ImportError:
+        _blur = lambda s: cv2.GaussianBlur(img_lin, (int(s * 6) | 1, int(s * 6) | 1), s)
+
+    N = _N_SCALE_LEVELS
+    levels = [img_lin] + [_blur(sigma * (i + 1) / N) for i in range(N)]
 
     def ramp(n, from_end=False):
         t = np.arange(n, dtype=np.float32)
@@ -485,8 +519,22 @@ def _edge_blur(image, sigma, edges=('top', 'bottom')):
     if 'left'   in edges: mask = np.maximum(mask, ramp(w)[None, :, None])
     if 'right'  in edges: mask = np.maximum(mask, ramp(w, from_end=True)[None, :, None])
 
-    blended_lin = (1.0 - mask) * img_lin + mask * blurred_lin
-    return np.clip(_linear_to_srgb(blended_lin) * 255.0, 0, 255).astype(np.uint8)
+    # Map mask ∈ [0, 1] to a continuous level index ∈ [0, N], then interpolate
+    # between the two bracketing blur levels — no ghosting from sharp/blurred mix.
+    levels_arr = np.stack(levels, axis=0)              # (N+1, H, W, 3)
+    level      = np.clip(mask * N, 0.0, float(N))     # (H, W, 1)
+    level_lo   = np.clip(np.floor(level).astype(np.int32), 0, N - 1)
+    alpha      = level - level_lo                      # (H, W, 1) fractional part
+
+    ll    = np.broadcast_to(level_lo, (h, w, 3))
+    rows  = np.arange(h)[:, None, None]
+    cols  = np.arange(w)[None, :, None]
+    chans = np.arange(3)[None, None, :]
+    lo    = levels_arr[ll,     rows, cols, chans]
+    hi    = levels_arr[ll + 1, rows, cols, chans]
+
+    result_lin = (1.0 - alpha) * lo + alpha * hi
+    return np.clip(_linear_to_srgb(result_lin) * 255.0, 0, 255).astype(np.uint8)
 
 
 def main():

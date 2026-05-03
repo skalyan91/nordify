@@ -67,4 +67,6 @@ After every Adam step, `snap()` projects the colour onto the RGB convex hull via
 
 **`_crop_to_aspect(image, ratio_w, ratio_h, align='center')`** — crops to the given aspect ratio. `align` is `'left'`/`'center'`/`'right'` when width is cropped, `'top'`/`'center'`/`'bottom'` when height is cropped. Applied before nordification so fewer pixels are processed.
 
-**`_edge_blur(image, sigma, edges)`** — blends a Gaussian-blurred version toward selected edges using a smoothstep ramp of width `3 × sigma` pixels. `edges` is a tuple of `'top'`, `'bottom'`, `'left'`, `'right'`; defaults to `('top', 'bottom')`. Controlled via `--blur PCT` and `--edges EDGES`.
+**`_gaussian_blur_mlx(img_lin, sigma)`** — separable Gaussian blur on GPU via MLX depthwise `conv2d` (two passes: horizontal then vertical). Falls back to `cv2.GaussianBlur` in `_edge_blur` if MLX is unavailable.
+
+**`_edge_blur(image, sigma, edges)`** — builds `_N_SCALE_LEVELS` (3) blur levels at σ/3, 2σ/3, σ and interpolates across them using a smoothstep ramp of width `3 × sigma` pixels from each selected edge. Scale-space interpolation avoids the ghosting artifact of blending sharp with a single fully-blurred image. All operations in linear light. Controlled via `--blur PCT` and `--edges EDGES`.
