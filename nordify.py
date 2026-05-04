@@ -457,7 +457,7 @@ def _crop_to_aspect(image, ratio_w, ratio_h, align='center'):
 
 
 _N_SCALE_LEVELS  = 50   # intermediate blur levels (0 = sharp, N = full blur)
-_BLUR_MASK_POWER = 8.0  # mask→level mapping: level = mask^p · N
+_BLUR_MASK_POWER = 16.0  # mask→level mapping: level = mask^p · N
 
 
 def _gaussian_blur_mlx(img_lin, sigma):
@@ -575,19 +575,17 @@ def main():
     if args.wallpaper:
         ratio_w, ratio_h = (int(x) for x in args.aspect.split(':'))
         image = _crop_to_aspect(image, ratio_w, ratio_h, align=args.align)
+        h = image.shape[0]
+        sigma_px = max(1, round(args.blur / 100.0 * h))
+        ramp_px  = max(1, round(args.ramp / 100.0 * h))
+        edges = tuple(e.strip() for e in args.edges.split(','))
+        image = _edge_blur(image, sigma=sigma_px, ramp_px=ramp_px, edges=edges)
 
     if args.mix:
         result = mix_convert(image)
     else:
         palette = build_lookup()
         result = convert(image, palette, dither=args.dither)
-
-    if args.wallpaper:
-        h = result.shape[0]
-        sigma_px = max(1, round(args.blur / 100.0 * h))
-        ramp_px  = max(1, round(args.ramp / 100.0 * h))
-        edges = tuple(e.strip() for e in args.edges.split(','))
-        result = _edge_blur(result, sigma=sigma_px, ramp_px=ramp_px, edges=edges)
 
     ok = cv2.imwrite(args.output, result)
     if not ok:
