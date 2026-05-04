@@ -575,11 +575,12 @@ def main():
     if args.wallpaper:
         ratio_w, ratio_h = (int(x) for x in args.aspect.split(':'))
         image = _crop_to_aspect(image, ratio_w, ratio_h, align=args.align)
-        h = image.shape[0]
-        sigma_px = max(1, round(args.blur / 100.0 * h))
-        ramp_px  = max(1, round(args.ramp / 100.0 * h))
-        edges = tuple(e.strip() for e in args.edges.split(','))
-        image = _edge_blur(image, sigma=sigma_px, ramp_px=ramp_px, edges=edges)
+        if args.blur > 0:
+            h = image.shape[0]
+            sigma_px = max(1, round(args.blur / 100.0 * h))
+            ramp_px  = max(1, round(args.ramp / 100.0 * h))
+            edges = tuple(e.strip() for e in args.edges.split(','))
+            image = _edge_blur(image, sigma=sigma_px, ramp_px=ramp_px, edges=edges)
 
     if args.mix:
         result = mix_convert(image)
