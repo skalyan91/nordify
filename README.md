@@ -31,6 +31,7 @@ python3 nordify.py <input> -o <output> [--dither fs] [--mix] [--wallpaper] [--as
 | `--align ALIGN` | Crop alignment: `left`, `center`, `right`, `top`, `bottom` (default: `center`) |
 | `--blur PCT` | Max Gaussian blur sigma as % of image height for `--wallpaper` (default: `2`) |
 | `--ramp PCT` | Blur ramp width as % of image height for `--wallpaper` (default: `50`) |
+| `--power P` | Blur curve exponent for `--wallpaper`: `sigma_eff ∝ mask^P` (default: `16`) |
 | `--edges EDGES` | Comma-separated edges to blur: `top,bottom,left,right` (default: `top,bottom`) |
 
 ### Examples
@@ -94,7 +95,7 @@ For a more detailed discussion of the algorithms and their artistic rationale, s
 
 ### Wallpaper preparation (`--wallpaper`)
 
-Crops the image to a target aspect ratio (default `16:9`), then blends in a Gaussian-blurred version toward selected edges using a [smoothstep](https://en.wikipedia.org/wiki/Smoothstep) ramp. `--aspect W:H` sets the ratio; `--align` controls which part of the image is kept (`left`/`center`/`right` when cropping width, `top`/`center`/`bottom` when cropping height). `--ramp` sets the spatial extent of the blend ramp as a percentage of image height (default 50%); `--blur` sets the maximum Gaussian sigma as a percentage of image height (default 2%), applied via a 16th-power ramp so blur is tightly concentrated at the very edge and the centre remains sharp. The blur is applied to the original image before nordification, so blended edge pixels are mapped into the Nord palette rather than mixing already-snapped colours outside the gamut. `--edges` selects which edges are blurred (default `top,bottom`, to accommodate a menu bar and dock).
+Crops the image to a target aspect ratio (default `16:9`), then blends in a Gaussian-blurred version toward selected edges using a [smoothstep](https://en.wikipedia.org/wiki/Smoothstep) ramp. `--aspect W:H` sets the ratio; `--align` controls which part of the image is kept (`left`/`center`/`right` when cropping width, `top`/`center`/`bottom` when cropping height). `--ramp` sets the spatial extent of the blend ramp as a percentage of image height (default 50%); `--blur` sets the maximum Gaussian sigma as a percentage of image height (default 2%), applied via a power-law ramp (`--power`, default 16) so blur is tightly concentrated at the very edge and the centre remains sharp. The blur is applied to the original image before nordification, so blended edge pixels are mapped into the Nord palette rather than mixing already-snapped colours outside the gamut. `--edges` selects which edges are blurred (default `top,bottom`, to accommodate a menu bar and dock).
 
 ## Nord Palette
 

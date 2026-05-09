@@ -488,15 +488,17 @@ def _gaussian_blur_mlx(img_lin, sigma):
     return np.array(t[0])  # (H, W, 3)
 
 
-def _edge_blur(image, sigma, ramp_px, edges=('top', 'bottom')):
+def _edge_blur(image, sigma, ramp_px, edges=('top', 'bottom'), power=None):
     """Gradient blur toward selected edges for wallpaper use.
 
     Builds _N_SCALE_LEVELS evenly-spaced blur levels (σᵢ = σ_max·i/N).
-    Mask→level mapping: level = mask^p·N (_BLUR_MASK_POWER=2) so
+    Mask→level mapping: level = mask^p·N (p = power or _BLUR_MASK_POWER) so
     sigma_eff(mask) = sigma_max·mask^p. ramp_px and sigma are independent:
     ramp_px sets the spatial extent of the blend, sigma sets the max blur.
     Convolutions on GPU via MLX when available, else cv2. All in linear light.
     """
+    if power is None:
+        power = _BLUR_MASK_POWER
     h, w = image.shape[:2]
     ramp_width = max(1, ramp_px)
 
@@ -527,7 +529,7 @@ def _edge_blur(image, sigma, ramp_px, edges=('top', 'bottom')):
     if 'right'  in edges: mask = np.maximum(mask, ramp(w, from_end=True)[None, :, None])
 
     levels_arr = np.stack(levels, axis=0)                                    # (N+1, H, W, 3)
-    level      = np.clip(mask ** _BLUR_MASK_POWER * N, 0.0, float(N))  # (H, W, 1)
+    level      = np.clip(mask ** power * N, 0.0, float(N))  # (H, W, 1)
     level_lo   = np.clip(np.floor(level).astype(np.int32), 0, N - 1)
     alpha      = level - level_lo                      # (H, W, 1) fractional part
 
@@ -562,7 +564,9 @@ def main():
     parser.add_argument("--blur", type=float, default=2.0, metavar="PCT",
                         help="Max Gaussian blur sigma as %% of image height for --wallpaper (default: 5)")
     parser.add_argument("--ramp", type=float, default=50.0, metavar="PCT",
-                        help="Blur ramp width as %% of image height for --wallpaper (default: 10)")
+                        help="Blur ramp width as %% of image height for --wallpaper (default: 50)")
+    parser.add_argument("--power", type=float, default=_BLUR_MASK_POWER, metavar="P",
+                        help="Blur curve exponent for --wallpaper: level = mask^P (default: %(default)g)")
     parser.add_argument("--edges", default="top,bottom", metavar="EDGES",
                         help="Comma-separated edges to blur for --wallpaper: top,bottom,left,right (default: top,bottom)")
     args = parser.parse_args()
@@ -580,7 +584,7 @@ def main():
             sigma_px = max(1, round(args.blur / 100.0 * h))
             ramp_px  = max(1, round(args.ramp / 100.0 * h))
             edges = tuple(e.strip() for e in args.edges.split(','))
-            image = _edge_blur(image, sigma=sigma_px, ramp_px=ramp_px, edges=edges)
+            image = _edge_blur(image, sigma=sigma_px, ramp_px=ramp_px, edges=edges, power=args.power)
 
     if args.mix:
         result = mix_convert(image)
