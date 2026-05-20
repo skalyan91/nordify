@@ -437,113 +437,6 @@ def convert(image, palette, dither=None):
     return (_oklab_to_bgr(out_lab) * 255.0).astype(np.uint8)
 
 
-def _crop_to_aspect(image, ratio_w, ratio_h, align='center'):
-    """Crop to the given aspect ratio.
-
-    When width is cropped, align is 'left'/'center'/'right'.
-    When height is cropped, align is 'top'/'center'/'bottom'.
-    """
-    h, w = image.shape[:2]
-    if w * ratio_h > h * ratio_w:   # image wider than target: crop width
-        new_w = h * ratio_w // ratio_h
-        excess = w - new_w
-        x0 = 0 if align == 'left' else excess if align == 'right' else excess // 2
-        return image[:, x0:x0 + new_w]
-    else:                            # image taller than target: crop height
-        new_h = w * ratio_h // ratio_w
-        excess = h - new_h
-        y0 = 0 if align == 'top' else excess if align == 'bottom' else excess // 2
-        return image[y0:y0 + new_h, :]
-
-
-_N_SCALE_LEVELS  = 50   # intermediate blur levels (0 = sharp, N = full blur)
-_BLUR_MASK_POWER = 16.0  # mask→level mapping: level = mask^p · N
-
-
-def _gaussian_blur_mlx(img_lin, sigma):
-    """Separable Gaussian blur on GPU via MLX depthwise convolution.
-
-    Pre-pads with NumPy reflect mode so boundary pixels are mirrored rather
-    than treated as black; the paired convolutions consume that padding exactly.
-    """
-    import mlx.core as mx
-    radius = round(3 * sigma)
-    x = np.arange(-radius, radius + 1, dtype=np.float32)
-    k = np.exp(-0.5 * (x / sigma) ** 2)
-    k = (k / k.sum()).astype(np.float32)
-
-    # Reflect-pad in NumPy (mirrors edge content, not black) then pass to MLX
-    padded = np.pad(img_lin, [(radius, radius), (radius, radius), (0, 0)], mode='reflect')
-    t = mx.array(padded[None])  # (1, H+2r, W+2r, 3)
-
-    # Horizontal depthwise: (1, H+2r, W+2r, 3) → (1, H+2r, W, 3)
-    kh = mx.array(np.tile(k[None, None, :, None], (3, 1, 1, 1)))
-    t = mx.conv2d(t, kh, groups=3)
-
-    # Vertical depthwise: (1, H+2r, W, 3) → (1, H, W, 3)
-    kv = mx.array(np.tile(k[None, :, None, None], (3, 1, 1, 1)))
-    t = mx.conv2d(t, kv, groups=3)
-
-    mx.eval(t)
-    return np.array(t[0])  # (H, W, 3)
-
-
-def _edge_blur(image, sigma, ramp_px, edges=('top', 'bottom'), power=None):
-    """Gradient blur toward selected edges for wallpaper use.
-
-    Builds _N_SCALE_LEVELS evenly-spaced blur levels (σᵢ = σ_max·i/N).
-    Mask→level mapping: level = mask^p·N (p = power or _BLUR_MASK_POWER) so
-    sigma_eff(mask) = sigma_max·mask^p. ramp_px and sigma are independent:
-    ramp_px sets the spatial extent of the blend, sigma sets the max blur.
-    Convolutions on GPU via MLX when available, else cv2. All in linear light.
-    """
-    if power is None:
-        power = _BLUR_MASK_POWER
-    h, w = image.shape[:2]
-    ramp_width = max(1, ramp_px)
-
-    img_lin = _srgb_to_linear(image.astype(np.float32) / 255.0)
-
-    try:
-        import mlx.core  # noqa: F401
-        _blur = lambda s: _gaussian_blur_mlx(img_lin, s)
-    except ImportError:
-        # BORDER_REFLECT_101: mirrors edge content (default, but stated explicitly)
-        _blur = lambda s: cv2.GaussianBlur(img_lin, (int(s * 6) | 1, int(s * 6) | 1), s,
-                                           borderType=cv2.BORDER_REFLECT_101)
-
-    N = _N_SCALE_LEVELS
-    levels = [img_lin] + [_blur(sigma * (i + 1) / N) for i in range(N)]
-
-    def ramp(n, from_end=False):
-        t = np.arange(n, dtype=np.float32)
-        if from_end:
-            t = (n - 1) - t
-        d = np.clip(t / ramp_width, 0.0, 1.0)
-        return 1.0 - d * d * (3.0 - 2.0 * d)  # smoothstep: 1 at edge, 0 beyond ramp
-
-    mask = np.zeros((h, w, 1), dtype=np.float32)
-    if 'top'    in edges: mask = np.maximum(mask, ramp(h)[:, None, None])
-    if 'bottom' in edges: mask = np.maximum(mask, ramp(h, from_end=True)[:, None, None])
-    if 'left'   in edges: mask = np.maximum(mask, ramp(w)[None, :, None])
-    if 'right'  in edges: mask = np.maximum(mask, ramp(w, from_end=True)[None, :, None])
-
-    levels_arr = np.stack(levels, axis=0)                                    # (N+1, H, W, 3)
-    level      = np.clip(mask ** power * N, 0.0, float(N))  # (H, W, 1)
-    level_lo   = np.clip(np.floor(level).astype(np.int32), 0, N - 1)
-    alpha      = level - level_lo                      # (H, W, 1) fractional part
-
-    ll    = np.broadcast_to(level_lo, (h, w, 3))
-    rows  = np.arange(h)[:, None, None]
-    cols  = np.arange(w)[None, :, None]
-    chans = np.arange(3)[None, None, :]
-    lo    = levels_arr[ll,     rows, cols, chans]
-    hi    = levels_arr[ll + 1, rows, cols, chans]
-
-    result_lin = (1.0 - alpha) * lo + alpha * hi
-    return np.clip(_linear_to_srgb(result_lin) * 255.0, 0, 255).astype(np.uint8)
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Convert an image to the Nord colour palette via Oklab snapping."
@@ -554,37 +447,12 @@ def main():
                         help="Dithering: 'fs' (Floyd-Steinberg with blue noise)")
     parser.add_argument("--mix", action="store_true",
                         help="Palette mixing gamut mapping (ignores --dither)")
-    parser.add_argument("--wallpaper", action="store_true",
-                        help="Crop to target aspect ratio and apply gradient blur at edges")
-    parser.add_argument("--aspect", default="16:9", metavar="W:H",
-                        help="Crop aspect ratio for --wallpaper (default: 16:9)")
-    parser.add_argument("--align", default="center",
-                        choices=["left", "center", "right", "top", "bottom"],
-                        help="Crop alignment for --wallpaper (default: center)")
-    parser.add_argument("--blur", type=float, default=2.0, metavar="PCT",
-                        help="Max Gaussian blur sigma as %% of image height for --wallpaper (default: 5)")
-    parser.add_argument("--ramp", type=float, default=50.0, metavar="PCT",
-                        help="Blur ramp width as %% of image height for --wallpaper (default: 50)")
-    parser.add_argument("--power", type=float, default=_BLUR_MASK_POWER, metavar="P",
-                        help="Blur curve exponent for --wallpaper: level = mask^P (default: %(default)g)")
-    parser.add_argument("--edges", default="top,bottom", metavar="EDGES",
-                        help="Comma-separated edges to blur for --wallpaper: top,bottom,left,right (default: top,bottom)")
     args = parser.parse_args()
 
     image = cv2.imread(args.input)
     if image is None:
         print(f"Error: cannot read image '{args.input}'", file=sys.stderr)
         sys.exit(1)
-
-    if args.wallpaper:
-        ratio_w, ratio_h = (int(x) for x in args.aspect.split(':'))
-        image = _crop_to_aspect(image, ratio_w, ratio_h, align=args.align)
-        if args.blur > 0:
-            h = image.shape[0]
-            sigma_px = max(1, round(args.blur / 100.0 * h))
-            ramp_px  = max(1, round(args.ramp / 100.0 * h))
-            edges = tuple(e.strip() for e in args.edges.split(','))
-            image = _edge_blur(image, sigma=sigma_px, ramp_px=ramp_px, edges=edges, power=args.power)
 
     if args.mix:
         result = mix_convert(image)

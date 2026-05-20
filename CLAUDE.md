@@ -4,21 +4,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**nord-lab** is a Python CLI tool that converts images to the [Nord colour palette](https://www.nordtheme.com/) using perceptually-uniform Oklab colour snapping, with optional dithering, palette mixing, and wallpaper preparation.
+**nord-lab** is a two-script Python CLI pipeline that prepares wallpapers in the [Nord colour palette](https://www.nordtheme.com/). `depth_blur.py` handles cropping and depth-guided blur; `nordify.py` handles palette conversion.
 
 ## Setup and Usage
 
 ```bash
 source venv/bin/activate
-python3 nordify.py <input> -o <output> [--dither fs] [--mix] [--wallpaper [--blur PCT]]
+
+# Step 1 — crop + depth-guided blur
+python3 depth_blur.py <input> -o <blurred> [--aspect W:H] [--align ...] [--blur PCT] [--smooth PCT] [--power P]
+
+# Step 2 — nordify
+python3 nordify.py <blurred> -o <output> [--dither fs] [--mix]
 ```
 
 Core dependencies: `numpy`, `opencv-python-headless` (in `venv/`).  
-Optional: `mlx` (Apple Silicon) — required for `--mix`.
+Depth estimation: `transformers`, `torch`, `pillow` (downloaded on first run from HuggingFace).  
+Optional: `mlx` (Apple Silicon) — required for `--mix`; accelerates blur pyramid in `depth_blur.py`.
 
 ## Architecture
 
-Everything lives in `nordify.py`. No other source files.
+Two scripts: `depth_blur.py` (preprocessing) and `nordify.py` (palette conversion).
 
 ### Colour pipeline
 
@@ -63,10 +69,20 @@ The hue is snapped: the palette entry chosen by the dithering mode determines `H
 
 After every Adam step, `snap()` projects the colour onto the RGB convex hull via 20 iterations of half-space projection (no GPU sync — fully fused MLX graph). In-hull pixels are returned unchanged. All GPU computation runs on MLX (Apple Silicon).
 
-### Wallpaper preparation (`--wallpaper`)
+## depth_blur.py
 
-**`_crop_to_aspect(image, ratio_w, ratio_h, align='center')`** — crops to the given aspect ratio. `align` is `'left'`/`'center'`/`'right'` when width is cropped, `'top'`/`'center'`/`'bottom'` when height is cropped. Applied before edge blur and nordification.
+Preprocessing script: crop → depth estimation → depth-guided blur.
 
-**`_gaussian_blur_mlx(img_lin, sigma)`** — separable Gaussian blur on GPU via MLX depthwise `conv2d` (two passes: horizontal then vertical). Pre-pads with NumPy `reflect` mode so boundary pixels mirror edge content rather than defaulting to black; the paired convolutions consume that padding exactly. Falls back to `cv2.GaussianBlur(..., borderType=BORDER_REFLECT_101)` in `_edge_blur` if MLX is unavailable.
+### Cropping
 
-**`_edge_blur(image, sigma, ramp_px, edges, power=None)`** — builds `_N_SCALE_LEVELS` (50) evenly-spaced blur levels (`σᵢ = σ_max·i/N`). Mask→level mapping: `level = mask^p·N` (p = `power` or `_BLUR_MASK_POWER=16`). `sigma` (max blur, default 2% of height), `ramp_px` (spatial ramp extent, default 50% of height), and `power` (curve exponent, default 16) are independent parameters. The high-power mapping keeps the centre sharp and concentrates blur tightly at the edge. Scale-space interpolation avoids ghosting. All operations in linear light. Applied to the original image **before** nordification so blended pixels are mapped into the Nord palette rather than blending already-snapped colours outside the gamut. Controlled via `--blur PCT`, `--ramp PCT`, `--power P`, and `--edges EDGES`.
+**`_crop_to_aspect(image, ratio_w, ratio_h, align='center')`** — crops to the given aspect ratio. `align` is `'left'`/`'center'`/`'right'` when width is cropped, `'top'`/`'center'`/`'bottom'` when height is cropped. Run by default; skip with `--no-crop`.
+
+### Depth estimation
+
+**`_estimate_depth(image_bgr, model)`** — runs Depth Anything V2 Small (`depth-anything/Depth-Anything-V2-Small-hf`) via the HuggingFace `transformers` pipeline. Uses MPS on Apple Silicon, CPU otherwise. Returns raw `(H, W)` float32 depth map (disparity convention: higher = closer/foreground). Resizes model output back to input resolution.
+
+### Depth-guided blur
+
+**`_gaussian_blur_mlx(img_lin, sigma)`** — separable Gaussian blur on GPU via MLX depthwise `conv2d` (two passes: horizontal then vertical). Reflect-pads in NumPy before passing to MLX. Falls back to `cv2.GaussianBlur(..., borderType=BORDER_REFLECT_101)` if MLX is unavailable.
+
+**`_depth_blur(image, depth_raw, sigma_max, n_levels, smooth_sigma, power)`** — builds an `n_levels`-deep Gaussian blur pyramid (`σᵢ = σ_max·i/N`, all in linear light). Pipeline: smooth depth map → normalise to `[0, 1]` → `depth^power` → interpolate between pyramid levels. Default `power=2` (quadratic) keeps the middle ground relatively sharp while blurring foreground strongly. `--invert-depth` flips the map to blur background instead. `--depth-only` saves the normalised depth map as greyscale for inspection.
