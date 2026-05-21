@@ -406,6 +406,25 @@ def mix_convert(image, strip_h=256):
     return (out_bgr * 255.0).astype(np.uint8)
 
 
+def _nighttime(image):
+    """Darken and cool: L→1-√(1-L), b shifted toward blue inversely proportional to L."""
+    lab = _bgr_to_oklab(image.astype(np.float32) / 255.0)
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    L = np.clip(L, 0.0, 1.0)
+
+    b_min, b_max = float(b.min()), float(b.max())
+    if b_max - b_min > 1e-6:
+        b_norm = (b - b_min) / (b_max - b_min)   # 0 = most blue, 1 = most yellow
+        # dark pixels (low L) get full squaring; bright pixels (L→1) get no shift
+        b_norm_new = b_norm * (L + b_norm * (1.0 - L))
+        b_new = b_norm_new * (b_max - b_min) + b_min
+    else:
+        b_new = b
+
+    out_lab = np.stack([1.0 - np.sqrt(1.0 - L), a, b_new], axis=-1)
+    return np.clip(_oklab_to_bgr(out_lab) * 255.0, 0, 255).astype(np.uint8)
+
+
 def convert(image, palette, dither=None):
     """Map every pixel to the nearest Nord colour by 3D Oklab distance,
     then snap the hue while keeping the pixel's own chroma and lightness."""
@@ -447,12 +466,17 @@ def main():
                         help="Dithering: 'fs' (Floyd-Steinberg with blue noise)")
     parser.add_argument("--mix", action="store_true",
                         help="Palette mixing gamut mapping (ignores --dither)")
+    parser.add_argument("--night", action="store_true",
+                        help="Nighttime preprocessing: darken (L→L²) and cool (b shifted toward blue)")
     args = parser.parse_args()
 
     image = cv2.imread(args.input)
     if image is None:
         print(f"Error: cannot read image '{args.input}'", file=sys.stderr)
         sys.exit(1)
+
+    if args.night:
+        image = _nighttime(image)
 
     if args.mix:
         result = mix_convert(image)

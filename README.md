@@ -10,29 +10,55 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-For palette mixing (`--mix`), also install:
+For depth estimation and palette mixing, also install:
 
 ```bash
-pip install mlx   # Apple Silicon (required for --mix)
+pip install transformers torch pillow  # depth_blur.py
+pip install mlx                        # --mix (Apple Silicon required)
 ```
 
-## Usage
+## Pipeline
+
+The pipeline is two scripts run in sequence:
 
 ```
-python3 nordify.py <input> -o <output> [--dither fs] [--mix] [--wallpaper] [--aspect W:H] [--align ALIGN] [--blur PCT] [--edges EDGES]
+depth_blur.py  →  nordify.py
+(crop + blur)     (palette conversion)
+```
+
+### Step 1 — `depth_blur.py`
+
+Crops to a target aspect ratio, estimates monocular depth, and applies a depth-guided Gaussian blur (foreground blurred most, background least).
+
+```
+python3 depth_blur.py <input> -o <blurred> [options]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--aspect W:H` | `16:9` | Crop aspect ratio |
+| `--align` | `center` | Crop alignment: `left`/`center`/`right`/`top`/`bottom` |
+| `--no-crop` | — | Skip aspect-ratio cropping |
+| `--blur PCT` | `2.0` | Max blur sigma as % of image height |
+| `--smooth PCT` | `1.0` | Depth-map smoothing sigma as % of image height |
+| `--power P` | `2.0` | Depth-to-blur curve exponent (`1`=linear, `2`=quadratic) |
+| `--invert-depth` | — | Blur background instead of foreground |
+| `--depth-only` | — | Save normalised depth map and exit |
+| `--model MODEL` | Depth Anything V2 Small | HuggingFace depth model ID |
+
+### Step 2 — `nordify.py`
+
+Maps every pixel to a Nord colour. Optionally applies a nighttime pre-processing pass before conversion.
+
+```
+python3 nordify.py <input> -o <output> [options]
 ```
 
 | Flag | Description |
 |------|-------------|
 | `--dither fs` | Floyd-Steinberg dithering with blue-noise seeding |
-| `--mix` | Palette mixing gamut mapping |
-| `--wallpaper` | Crop to target aspect ratio and apply gradient blur at edges |
-| `--aspect W:H` | Crop aspect ratio for `--wallpaper` (default: `16:9`) |
-| `--align ALIGN` | Crop alignment: `left`, `center`, `right`, `top`, `bottom` (default: `center`) |
-| `--blur PCT` | Max Gaussian blur sigma as % of image height for `--wallpaper` (default: `2`) |
-| `--ramp PCT` | Blur ramp width as % of image height for `--wallpaper` (default: `50`) |
-| `--power P` | Blur curve exponent for `--wallpaper`: `sigma_eff ∝ mask^P` (default: `16`) |
-| `--edges EDGES` | Comma-separated edges to blur: `top,bottom,left,right` (default: `top,bottom`) |
+| `--mix` | Palette mixing gamut mapping (requires MLX) |
+| `--night` | Nighttime pre-processing: darken and cool the image before palette conversion |
 
 ### Examples
 
@@ -46,14 +72,16 @@ python3 nordify.py photo.jpg -o photo_nord.png --dither fs
 # Palette mixing
 python3 nordify.py photo.jpg -o photo_nord.png --mix
 
-# Wallpaper (16:9 crop + edge blur, combinable with any mode)
-python3 nordify.py photo.jpg -o wallpaper.png --mix --wallpaper
+# Nighttime version with palette mixing
+python3 nordify.py photo.jpg -o photo_night.png --night --mix
 
-# Wallpaper for a 3:2 display, keeping the right side of the image
-python3 nordify.py photo.jpg -o wallpaper.png --mix --wallpaper --aspect 3:2 --align right
+# Full wallpaper pipeline: 16:9 crop + depth blur, then nordify
+python3 depth_blur.py photo.jpg -o blurred.png
+python3 nordify.py blurred.png -o wallpaper.png --mix
 
-# Wallpaper with custom blur and ramp
-python3 nordify.py photo.jpg -o wallpaper.png --mix --wallpaper --blur 5 --ramp 30
+# 3:2 wallpaper, keeping left side, heavier blur
+python3 depth_blur.py photo.jpg -o blurred.png --aspect 3:2 --align left --blur 4
+python3 nordify.py blurred.png -o wallpaper.png --mix
 ```
 
 ## Samples
@@ -66,8 +94,10 @@ Original photo by [Philippe Gauthier](https://unsplash.com/photos/orange-fruits-
 | ![Original](samples/original.jpg) | ![Snapped](samples/snapped.png) |
 | **Floyd-Steinberg dithering** | **Palette mixing** |
 | ![Dithered](samples/dithered.png) | ![Mixed](samples/mixed.png) |
+| **Nighttime (`--night`)** | |
+| ![Night](samples/night.png) | |
 
-**Palette mixing + wallpaper crop:**
+**Palette mixing + wallpaper crop (`depth_blur.py` → `nordify.py --mix`):**
 
 ![Wallpaper](samples/wallpaper.png)
 
@@ -93,9 +123,16 @@ Each phase runs [Adam gradient descent](https://en.wikipedia.org/wiki/Stochastic
 
 For a more detailed discussion of the algorithms and their artistic rationale, see [BACKGROUND.md](BACKGROUND.md).
 
-### Wallpaper preparation (`--wallpaper`)
+### Depth-guided blur (`depth_blur.py`)
 
-Crops the image to a target aspect ratio (default `16:9`), then blends in a Gaussian-blurred version toward selected edges using a [smoothstep](https://en.wikipedia.org/wiki/Smoothstep) ramp. `--aspect W:H` sets the ratio; `--align` controls which part of the image is kept (`left`/`center`/`right` when cropping width, `top`/`center`/`bottom` when cropping height). `--ramp` sets the spatial extent of the blend ramp as a percentage of image height (default 50%); `--blur` sets the maximum Gaussian sigma as a percentage of image height (default 2%), applied via a power-law ramp (`--power`, default 16) so blur is tightly concentrated at the very edge and the centre remains sharp. The blur is applied to the original image before nordification, so blended edge pixels are mapped into the Nord palette rather than mixing already-snapped colours outside the gamut. `--edges` selects which edges are blurred (default `top,bottom`, to accommodate a menu bar and dock).
+Estimates monocular depth via [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) and builds a Gaussian blur pyramid. Each pixel is blended between pyramid levels according to its (smoothed, normalised) depth value raised to `--power`, so foreground objects receive strong blur while the background stays sharp. Blur and pyramid construction use MLX GPU acceleration on Apple Silicon when available.
+
+### Nighttime pre-processing (`--night`)
+
+Transforms pixel colours in Oklab before palette conversion:
+
+- **Luminance** — `L → 1 − √(1 − L)`: a curve that darkens mid-tones and highlights while keeping shadows from crushing to black.
+- **Yellow/blue axis** — `b` is shifted toward blue in inverse proportion to luminance: dark pixels receive the full shift (warming tones become cool), bright pixels are left unchanged (artificial lights and highlights keep their original colour temperature).
 
 ## Nord Palette
 
