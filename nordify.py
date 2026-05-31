@@ -7,6 +7,25 @@ import sys
 import cv2
 import numpy as np
 
+LOG_EPS = 1e-4   # floor for log-space pigment transform; log(0+LOG_EPS) ≈ -9.2
+KM_EPS  = 1e-3   # minimum reflectance before K/S conversion; K/S(KM_EPS) ≈ 499
+
+
+def _lin_to_km(r):
+    """Linear reflectance → Kubelka-Munk K/S ratio: (1-R)² / 2R."""
+    r = np.maximum(r, KM_EPS)
+    return (1.0 - r) ** 2 / (2.0 * r)
+
+
+def _km_to_lin(ks):
+    """Kubelka-Munk K/S ratio → linear reflectance.
+
+    Numerically stable form: R = 1 / (1 + K/S + sqrt(K/S² + 2·K/S))
+    avoids catastrophic cancellation for large K/S (dark colours).
+    """
+    ks = np.maximum(ks, 0.0)
+    return np.clip(1.0 / (1.0 + ks + np.sqrt(ks * ks + 2.0 * ks + 1e-12)), 0.0, 1.0)
+
 
 def _srgb_to_linear(c):
     return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
@@ -220,12 +239,20 @@ def _halfspace_eqs(points):
     return np.array(eqs, dtype=np.float32) if eqs else np.zeros((0, 4), dtype=np.float32)
 
 
-def _mix_strip(strip_lin, hull_eqs, max_iters=500, tol=1e-5):
-    """Optimise out-of-hull pixels directly in RGB space.
+def _mix_strip(strip_lin, hull_eqs, space='linear', hull_eqs_km=None,
+               max_iters=500, tol=1e-5):
+    """Optimise out-of-hull pixels in the model's working space.
 
-    strip_lin : (M, 3) float32 — pixel linear RGB (chroma already clamped)
-    hull_eqs  : (F, 4) float32 — half-space equations from _halfspace_eqs
-    Returns   : (M, 3) float32 — optimised linear RGB
+    strip_lin   : (M, 3) float32 — pixel values in the working space:
+                    'linear' → linear RGB
+                    'log'    → log(lin + LOG_EPS)
+                    'km'     → log(1 + K/S)
+    hull_eqs    : (F, 4) float32 — half-space equations in strip_lin's space.
+    hull_eqs_km : (G, 4) float32 — (KM only) half-space equations in raw K/S space.
+                    When supplied, each phase runs its first half in log(1+K/S)
+                    then switches to raw K/S for the second half, ending with
+                    strict KM mixing enforcement.
+    Returns     : (M, 3) float32 — optimised values in strip_lin's space.
     """
     import mlx.core as mx
     M = strip_lin.shape[0]
@@ -248,7 +275,7 @@ def _mix_strip(strip_lin, hull_eqs, max_iters=500, tol=1e-5):
     target  = mx.array(strip_lin[rem])
     color   = mx.array(strip_lin[rem])
 
-    def _oklab(rgb):
+    def _rgb_to_oklab(rgb):
         r, g, b = rgb[:, 0], rgb[:, 1], rgb[:, 2]
         l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
         m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
@@ -260,6 +287,16 @@ def _mix_strip(strip_lin, hull_eqs, max_iters=500, tol=1e-5):
         a  = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
         b_ = 0.0259040371 * l_ + 0.4072165126 * m_ - 0.4331205297 * s_
         return mx.stack([L, a, b_], axis=-1)
+
+    def _oklab(c):
+        if space == 'log':
+            rgb = mx.clip(mx.exp(c) - LOG_EPS, 0.0, 1.0)
+        elif space == 'km':
+            ks  = mx.maximum(mx.exp(c) - 1.0, 0.0)
+            rgb = mx.clip(1.0 / (1.0 + ks + mx.sqrt(ks * ks + 2.0 * ks + 1e-12)), 0.0, 1.0)
+        else:
+            rgb = c
+        return _rgb_to_oklab(rgb)
 
     target_ok = _oklab(target)
     mx.eval(target_ok)
@@ -276,64 +313,115 @@ def _mix_strip(strip_lin, hull_eqs, max_iters=500, tol=1e-5):
             per_px  = mx.max(v, axis=-1)
             worst_f = mx.argmax(v, axis=-1)
             c       = c - mx.maximum(per_px, 0.0)[:, None] * normals[worst_f]
+        if space == 'km':
+            c = mx.maximum(c, 0.0)  # log(1+K/S) ≥ 0
         return c
 
-    def _adam_run(loss_fn, c):
+    # ── KM phased mode: raw-K/S snap + oklab ──────────────────────────────────
+    km_phased = (space == 'km' and hull_eqs_km is not None)
+    if km_phased:
+        normals_km = mx.array(hull_eqs_km[:, :3])
+        d_vals_km  = mx.array(hull_eqs_km[:, 3])
+
+        def _oklab_km_raw(c):
+            ks  = mx.maximum(c, 0.0)
+            rgb = mx.clip(1.0 / (1.0 + ks + mx.sqrt(ks * ks + 2.0 * ks + 1e-12)), 0.0, 1.0)
+            return _rgb_to_oklab(rgb)
+
+        def snap_km_raw(c):
+            for _ in range(20):
+                v       = c @ normals_km.T + d_vals_km[None, :]
+                per_px  = mx.max(v, axis=-1)
+                worst_f = mx.argmax(v, axis=-1)
+                c       = c - mx.maximum(per_px, 0.0)[:, None] * normals_km[worst_f]
+            return mx.maximum(c, 0.0)  # K/S ≥ 0
+
+    def _adam_run(loss_fn, c, snap_fn=None, n_iters=None):
+        if snap_fn is None:
+            snap_fn = snap
+        if n_iters is None:
+            n_iters = max_iters
         lag = mx.value_and_grad(loss_fn)
         lr, b1, b2, eps = 0.01, 0.9, 0.999, 1e-8
-        m = mx.zeros((M_r, 3))
-        v = mx.zeros((M_r, 3))
+        m_a = mx.zeros((M_r, 3))
+        v_a = mx.zeros((M_r, 3))
         prev = float('inf')
-        for step in range(1, max_iters + 1):
+        for step in range(1, n_iters + 1):
             val, grad = lag(c)
-            m = b1 * m + (1 - b1) * grad
-            v = b2 * v + (1 - b2) * grad * grad
-            c = snap(c - lr * (m / (1 - b1 ** step)) / (mx.sqrt(v / (1 - b2 ** step)) + eps))
-            mx.eval(c, m, v, val)
+            m_a = b1 * m_a + (1 - b1) * grad
+            v_a = b2 * v_a + (1 - b2) * grad * grad
+            c = snap_fn(c - lr * (m_a / (1 - b1 ** step)) / (mx.sqrt(v_a / (1 - b2 ** step)) + eps))
+            mx.eval(c, m_a, v_a, val)
             curr = float(val)
             if abs(curr - prev) < tol:
                 break
             prev = curr
         return c
 
+    def _run_phase(loss_log, loss_km, c):
+        """First half in log(1+K/S), second half in raw K/S, return log(1+K/S)."""
+        half = max_iters // 2
+        c = _adam_run(loss_log, c, snap_fn=snap, n_iters=half)
+        c_km = snap_km_raw(mx.maximum(mx.exp(c) - 1.0, 0.0))
+        mx.eval(c_km)
+        c_km = _adam_run(loss_km, c_km, snap_fn=snap_km_raw, n_iters=max_iters - half)
+        return mx.log(mx.maximum(c_km, 0.0) + 1.0)
+
     color = snap(color)
     mx.eval(color)
 
     # ── Phase 1: match lightness ──────────────────────────────────────────────
-    def loss_L(c):
-        return ((_oklab(c)[:, 0] - L_target) ** 2).mean()
-
-    color = _adam_run(loss_L, color)
+    if km_phased:
+        color = _run_phase(
+            lambda c: ((_oklab(c)        [:, 0] - L_target) ** 2).mean(),
+            lambda c: ((_oklab_km_raw(c) [:, 0] - L_target) ** 2).mean(),
+            color)
+    else:
+        color = _adam_run(lambda c: ((_oklab(c)[:, 0] - L_target) ** 2).mean(), color)
 
     # ── Phase 2: match hue, preserve L ───────────────────────────────────────
-    def loss_H(c):
-        lab   = _oklab(c)
+    def _loss_H(oklab_fn, c):
+        lab   = oklab_fn(c)
         cross = lab[:, 1] * b_hat_t - lab[:, 2] * a_hat_t
         return (cross ** 2).mean() + 1000.0 * ((lab[:, 0] - L_target) ** 2).mean()
 
-    color = _adam_run(loss_H, color)
+    if km_phased:
+        color = _run_phase(lambda c: _loss_H(_oklab,        c),
+                           lambda c: _loss_H(_oklab_km_raw, c), color)
+    else:
+        color = _adam_run(lambda c: _loss_H(_oklab, c), color)
 
     # ── Phase 3: match chroma, preserve H and L ───────────────────────────────
-    def loss_C(c):
-        lab   = _oklab(c)
+    def _loss_C(oklab_fn, c):
+        lab   = oklab_fn(c)
         C_mix = mx.sqrt(lab[:, 1] ** 2 + lab[:, 2] ** 2 + 1e-16)
         cross = lab[:, 1] * b_hat_t - lab[:, 2] * a_hat_t
         return (  (C_mix - C_target) ** 2).mean() \
              + 1000.0 * (cross ** 2).mean() \
              + 1000.0 * ((lab[:, 0] - L_target) ** 2).mean()
 
-    color = _adam_run(loss_C, color)
+    if km_phased:
+        color = _run_phase(lambda c: _loss_C(_oklab,        c),
+                           lambda c: _loss_C(_oklab_km_raw, c), color)
+    else:
+        color = _adam_run(lambda c: _loss_C(_oklab, c), color)
 
     mx.eval(color)
     out[rem] = np.array(color)
     return out
 
 
-def mix_convert(image, strip_h=256):
-    """Palette mixing gamut mapping (convex combination model).
+def mix_convert(image, model='additive', strip_h=256):
+    """Palette mixing gamut mapping.
 
-    Pixels whose linear-RGB colour lies in the convex hull of the Nord palette
-    (plus black and white) are left unchanged.  Others are remapped to the
+    model='additive' — convex hull in linear RGB (light/additive mixing).
+    model='pigment'  — convex hull in log(linear_RGB + LOG_EPS); convex
+                       combinations = Beer's law transparent-pigment mixing:
+                       T_mix = T_A^w * T_B^(1-w).
+    model='opaque'   — convex hull in Kubelka-Munk K/S = (1-R)²/2R; convex
+                       combinations = opaque paint mixing per K-M theory.
+
+    Pixels inside the hull are left unchanged; others are remapped to the
     nearest in-hull colour by optimising lightness, hue, and chroma sequentially.
     """
     try:
@@ -341,6 +429,8 @@ def mix_convert(image, strip_h=256):
     except ImportError:
         print("Error: --mix requires MLX (pip install mlx)", file=sys.stderr)
         sys.exit(1)
+
+    space = {'additive': 'linear', 'pigment': 'log', 'opaque': 'km'}[model]
 
     # Palette in linear RGB (R, G, B order)
     pal_bgr = np.array(PALETTE_BGR, dtype=np.float32) / 255.0  # (P, 3) sRGB
@@ -350,19 +440,30 @@ def mix_convert(image, strip_h=256):
         _srgb_to_linear(pal_bgr[:, 0]),
     ], axis=-1).astype(np.float32)                              # (P, 3) linear RGB
 
-    pal_ext = np.vstack([
-        pal_lin,
-        np.zeros((1, 3), dtype=np.float32),
-        np.ones((1, 3),  dtype=np.float32),
-    ])                                                           # (P+2, 3) linear RGB
-    hull_eqs = _halfspace_eqs(pal_ext)                          # (F, 4) — computed once
-
-    # Clamp image chroma to the palette's Oklab chroma range
-    pal_ok = np.stack(
-        _linear_rgb_to_oklab(pal_lin[:, 0], pal_lin[:, 1], pal_lin[:, 2]), axis=-1,
-    )
-    pal_C    = np.sqrt(pal_ok[:, 1] ** 2 + pal_ok[:, 2] ** 2)
-    C_min, C_max = float(pal_C.min()), float(pal_C.max())
+    # Build hull in the working space
+    black = np.zeros((1, 3), dtype=np.float32)
+    white = np.ones((1, 3),  dtype=np.float32)
+    if space == 'log':
+        pal_work = np.log(pal_lin + LOG_EPS)
+        pal_ext  = np.vstack([pal_work,
+                              np.log(black + LOG_EPS),
+                              np.log(white + LOG_EPS)])
+    elif space == 'km':
+        pal_km    = _lin_to_km(pal_lin)
+        pal_work  = np.log(1.0 + pal_km)
+        black_km  = _lin_to_km(black)
+        white_km  = _lin_to_km(white)
+        # Log(1+K/S) hull — well-conditioned range [0, log(500)≈6.2].
+        pal_ext   = np.vstack([pal_work,
+                               np.log(1.0 + black_km),
+                               np.log(1.0 + white_km)])
+        # Raw K/S hull — used for the strict-KM second half of each phase.
+        pal_ext_km = np.vstack([pal_km, black_km, white_km])
+    else:
+        pal_work = pal_lin
+        pal_ext  = np.vstack([pal_lin, black, white])
+    hull_eqs    = _halfspace_eqs(pal_ext)                       # (F, 4) — computed once
+    hull_eqs_km = _halfspace_eqs(pal_ext_km) if space == 'km' else None
 
     # Image in linear RGB (R, G, B order)
     img_f   = image.astype(np.float32) / 255.0
@@ -372,29 +473,34 @@ def mix_convert(image, strip_h=256):
         _srgb_to_linear(img_f[:, :, 0]),
     ], axis=-1).astype(np.float32)                              # (H, W, 3) linear RGB
 
-    img_ok  = np.stack(
-        _linear_rgb_to_oklab(img_lin[:, :, 0], img_lin[:, :, 1], img_lin[:, :, 2]), axis=-1,
-    ).astype(np.float32)
-    img_C   = np.sqrt(img_ok[:, :, 1] ** 2 + img_ok[:, :, 2] ** 2)
-    scale   = np.where(img_C > 1e-10, np.clip(img_C, C_min, C_max) / np.maximum(img_C, 1e-10), 1.0)
-    img_ok[:, :, 1] *= scale
-    img_ok[:, :, 2] *= scale
-    r_c, g_c, b_c = _oklab_to_linear_rgb(img_ok[:, :, 0], img_ok[:, :, 1], img_ok[:, :, 2])
-    img_lin = np.stack([
-        np.clip(r_c, 0.0, 1.0), np.clip(g_c, 0.0, 1.0), np.clip(b_c, 0.0, 1.0),
-    ], axis=-1).astype(np.float32)
+    # Transform image to working space.
+    # km: use log(1+K/S) for the optimiser variable (hull/snap use raw K/S).
+    if space == 'log':
+        img_work = np.log(img_lin + LOG_EPS)
+    elif space == 'km':
+        img_work = np.log(1.0 + _lin_to_km(img_lin))
+    else:
+        img_work = img_lin
 
-    rows, cols = img_lin.shape[:2]
-    out_lin = np.empty((rows, cols, 3), dtype=np.float32)
+    rows, cols = img_work.shape[:2]
+    out_work = np.empty((rows, cols, 3), dtype=np.float32)
 
-    print("  [mix] device=mlx", file=sys.stderr)
+    print(f"  [mix] model={model} device=mlx", file=sys.stderr)
     for r0 in range(0, rows, strip_h):
         r1 = min(r0 + strip_h, rows)
         h  = r1 - r0
         print(f"  [mix] rows {r0}–{r1} / {rows}", file=sys.stderr, flush=True)
-        strip  = img_lin[r0:r1].reshape(-1, 3)
-        result = _mix_strip(strip, hull_eqs)
-        out_lin[r0:r1] = result.reshape(h, cols, 3)
+        strip  = img_work[r0:r1].reshape(-1, 3)
+        result = _mix_strip(strip, hull_eqs, space=space, hull_eqs_km=hull_eqs_km)
+        out_work[r0:r1] = result.reshape(h, cols, 3)
+
+    # Convert working space back to linear RGB.
+    if space == 'log':
+        out_lin = np.clip(np.exp(out_work) - LOG_EPS, 0.0, 1.0)
+    elif space == 'km':
+        out_lin = _km_to_lin(np.maximum(np.exp(out_work) - 1.0, 0.0))
+    else:
+        out_lin = out_work
 
     # Linear RGB → sRGB → BGR uint8
     out_srgb = np.stack([
@@ -464,8 +570,12 @@ def main():
     parser.add_argument("-o", "--output", required=True, help="Output image path")
     parser.add_argument("--dither", choices=["fs"],
                         help="Dithering: 'fs' (Floyd-Steinberg with blue noise)")
-    parser.add_argument("--mix", action="store_true",
-                        help="Palette mixing gamut mapping (ignores --dither)")
+    parser.add_argument("--mix", nargs="?", const="additive",
+                        choices=["additive", "pigment", "opaque"],
+                        help="Palette mixing model: 'additive' (linear RGB hull, default), "
+                             "'pigment' (log-space hull, Beer's law transparent-pigment mixing), "
+                             "or 'opaque' (Kubelka-Munk K/S hull, opaque paint mixing). "
+                             "Ignores --dither.")
     parser.add_argument("--night", action="store_true",
                         help="Nighttime preprocessing: darken (L→L²) and cool (b shifted toward blue)")
     args = parser.parse_args()
@@ -478,8 +588,8 @@ def main():
     if args.night:
         image = _nighttime(image)
 
-    if args.mix:
-        result = mix_convert(image)
+    if args.mix is not None:
+        result = mix_convert(image, model=args.mix)
     else:
         palette = build_lookup()
         result = convert(image, palette, dither=args.dither)
