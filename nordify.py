@@ -250,8 +250,8 @@ def _mix_strip(strip_lin, hull_eqs, space='linear', hull_eqs_km=None,
     hull_eqs    : (F, 4) float32 — half-space equations in strip_lin's space.
     hull_eqs_km : (G, 4) float32 — (KM only) half-space equations in raw K/S space.
                     When supplied, each phase runs its first half in log(1+K/S)
-                    then switches to raw K/S for the second half, ending with
-                    strict KM mixing enforcement.
+                    (hull_eqs) then switches to raw K/S (hull_eqs_km) for the
+                    second half, ending with strict KM mixing enforcement.
     Returns     : (M, 3) float32 — optimised values in strip_lin's space.
     """
     import mlx.core as mx

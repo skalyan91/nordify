@@ -139,7 +139,7 @@ After every Adam step the colour is snapped back onto the hull boundary.
 
 #### Opaque model: phased optimisation
 
-Raw K/S values span 0–499 (pure white to pure black), making the hull poorly conditioned for gradient-based optimisation. Each phase therefore runs in two halves:
+Raw K/S values span 0–499 (pure white to pure black), making the hull poorly conditioned for gradient-based optimisation. The lightness phase therefore runs in two halves:
 
 1. **First half — log(1+K/S) space.** The reparameterisation compresses the range to [0, 6.2], giving the POCS snap and Adam well-conditioned steps throughout the reflectance range.
 2. **Second half — raw K/S space.** The point is converted to K/S, re-snapped onto the raw-K/S hull, and refined with strict Kubelka-Munk mixing as the final constraint.
