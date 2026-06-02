@@ -116,31 +116,61 @@ def _estimate_depth(image_bgr, model=_DEFAULT_MODEL):
                       interpolation=cv2.INTER_LINEAR)
 
 
-def _depth_blur(image, depth_raw, sigma_max, n_levels=_N_BLUR_LEVELS, smooth_sigma=10.0,
-                power=2.0):
+def _dilate_depth(depth_norm, sigma_max, n_levels):
+    """Soft depth-map dilation with cosine spatial falloff.
+
+    Linearly-spaced radii r_k = r_max·k/K with sinusoidal weights w_k = sin(πk/K)
+    produce a cosine-shaped spatial gradient near foreground edges:
+        blend(δ) = d_bg + (d_fg − d_bg) · (1 + cos(π·δ/r_max)) / 2
+    Zero-derivative transitions at both the inner (δ=0) and outer (δ=r_max)
+    boundaries — smooth at both ends.  When multiple k values round to the same
+    integer radius their weights are accumulated before computing the weighted mean.
+    """
+    r_max = sigma_max
+    K = n_levels
+
+    radius_weight: dict = {}
+    for k in range(K + 1):
+        r = int(round(r_max * k / K))
+        w = float(np.sin(np.pi * k / K))
+        radius_weight[r] = radius_weight.get(r, 0.0) + w
+
+    total_w = sum(radius_weight.values())
+    result = np.zeros_like(depth_norm)
+    for r, w in sorted(radius_weight.items()):
+        if w == 0.0:
+            continue
+        if r == 0:
+            dilation = depth_norm
+        else:
+            ks = 2 * r + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+            dilation = cv2.dilate(depth_norm, kernel).astype(np.float32)
+        result += (w / total_w) * dilation
+
+    return result
+
+
+def _depth_blur(image, depth_raw, sigma_max, n_levels=_N_BLUR_LEVELS, power=2.0):
     """Apply depth-guided variable Gaussian blur in linear light.
 
     depth_raw  : (H, W) float32 — raw depth (any scale); higher = more blur
     sigma_max  : maximum Gaussian sigma (pixels)
     n_levels   : blur pyramid depth (higher = smoother level transitions)
-    smooth_sigma: Gaussian sigma (pixels) applied to the depth map before use
     power      : exponent applied to normalised depth before level mapping;
                  2.0 = quadratic (keeps middle ground relatively sharp)
 
-    Pipeline: blur depth → normalise to [0,1] → depth^power → pyramid level.
+    Pipeline: normalise depth → variable-radius dilation → depth^power → pyramid level.
     """
-    # Blur the depth map, then normalise to [0, 1]
-    if smooth_sigma > 0:
-        ks    = int(smooth_sigma * 6) | 1
-        depth = cv2.GaussianBlur(depth_raw, (ks, ks), smooth_sigma)
-    else:
-        depth = depth_raw.copy()
-
-    d_min, d_max = float(depth.min()), float(depth.max())
+    # Normalise to [0, 1], then dilate
+    d_min, d_max = float(depth_raw.min()), float(depth_raw.max())
     if d_max - d_min > 1e-6:
-        depth = (depth - d_min) / (d_max - d_min)
+        depth = (depth_raw - d_min) / (d_max - d_min)
     else:
-        depth = np.zeros_like(depth)
+        depth = np.zeros_like(depth_raw)
+
+    print(f"  [blur] dilating depth map …", file=sys.stderr, flush=True)
+    depth = _dilate_depth(depth, sigma_max, n_levels)
 
     img_lin = _srgb_to_linear(image.astype(np.float32) / 255.0)
 
@@ -207,8 +237,6 @@ def main():
     # Blur
     parser.add_argument("--blur", type=float, default=2.0, metavar="PCT",
                         help="Max blur sigma as %% of image height")
-    parser.add_argument("--smooth", type=float, default=1.0, metavar="PCT",
-                        help="Depth-map smoothing sigma as %% of image height")
     parser.add_argument("--levels", type=int, default=_N_BLUR_LEVELS, metavar="N",
                         help="Blur pyramid levels")
     parser.add_argument("--power", type=float, default=2.0, metavar="P",
@@ -235,14 +263,12 @@ def main():
         vis = (depth_raw - d_min) / (d_max - d_min) if d_max > d_min else np.zeros_like(depth_raw)
         ok  = cv2.imwrite(args.output, (vis * 255).astype(np.uint8))
     else:
-        h          = image.shape[0]
-        sigma_px   = max(1.0, args.blur   / 100.0 * h)
-        smooth_px  = max(0.0, args.smooth / 100.0 * h)
-        result     = _depth_blur(image, depth_raw,
-                                 sigma_max=sigma_px,
-                                 n_levels=args.levels,
-                                 smooth_sigma=smooth_px,
-                                 power=args.power)
+        h        = image.shape[0]
+        sigma_px = max(1.0, args.blur / 100.0 * h)
+        result   = _depth_blur(image, depth_raw,
+                               sigma_max=sigma_px,
+                               n_levels=args.levels,
+                               power=args.power)
         ok = cv2.imwrite(args.output, result)
 
     if not ok:

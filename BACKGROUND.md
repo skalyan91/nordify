@@ -38,22 +38,36 @@ With Nord's 16 colours this works well in areas of high contrast, but in smooth 
 
 Seeding the diffusion with a [blue-noise](https://en.wikipedia.org/wiki/Blue_noise) texture (generated via the void-and-cluster algorithm, Ulichney 1993) breaks those streaks up. Blue noise has energy concentrated at high spatial frequencies — it looks random at the scale of a few pixels while remaining evenly distributed overall, like the stipple of a skilled engraver rather than a mechanical grid. The result is dithering that reads as organic texture rather than digital artefact.
 
-## Palette mixing (`--mix`): thinking like an artist
+## Palette mixing (`--mix`): spectral Kubelka-Munk
 
-The `--mix` mode is based on a paint-mixing model: any colour achievable by blending Nord palette entries (like pigments on a palette) lies inside the *convex hull* of those entries in linear RGB space. A pixel outside the hull cannot be reproduced by any mixture, so it must be approximated by the nearest in-hull colour.
+### Physical basis
 
-Finding that nearest colour is a constrained optimisation problem, and the solution mirrors how an artist builds up a painting from scratch:
+When a painter mixes two opaque paints, the result is not a simple average of their colours. Each pigment absorbs and scatters light differently at every wavelength; mixing them combines those physical processes, not their RGB numbers. The correct model for opaque paint mixtures was worked out by Paul Kubelka and Franz Munk in 1931. Their key insight: for a mixture of paints, the ratio K/S (absorption coefficient divided by scattering coefficient) at each wavelength combines *linearly* by weight, even though the resulting reflectance is a non-linear function of K/S.
 
-### Phase 1 — value (lightness)
+In practice, the K/S ratio for a measured reflectance R at a single wavelength is:
 
-A painter's first act is usually a *value sketch* or grisaille underpainting: getting the light/dark relationships right before committing to colour. A painting that reads well in greyscale will read well in colour. In nordify, Phase 1 minimises the difference in lightness L between the remapped colour and the original, while keeping the colour on the hull boundary. See: [value (art)](https://en.wikipedia.org/wiki/Lightness).
+> K/S = (1 − R)² / 2R
 
-### Phase 2 — hue
+and to convert back: R = 1 / (1 + K/S + √(K/S² + 2·K/S)).
 
-With the values established, the painter lays in the colour temperature and hue relationships — the warm versus cool areas, the colour bias of shadows. Phase 2 minimises the angular difference in hue (the cross-product of the hue direction vectors in Oklab) while penalising any drift from the lightness achieved in Phase 1.
+### Spectral representation
 
-### Phase 3 — chroma (saturation)
+Rather than storing palette colours as single RGB triples, `--mix` fits each Nord colour with a 31-band reflectance spectrum (380–700 nm in 10 nm steps). Each band's reflectance is modelled as a clamped Gaussian:
 
-Finally, the painter adjusts the intensity of each colour — pushing it more saturated in the lights, graying it down in the shadows. Phase 3 minimises the chroma difference while holding both the hue and lightness achieved in the earlier phases.
+> R(λ) = R_base + A · exp(−(λ − λ₀)² / 2σ²)
 
-Each phase runs [Adam gradient descent](https://en.wikipedia.org/wiki/Stochastic_gradient_descent#Adam) until convergence, with the colour projected back onto the hull boundary after every step (via iterative half-space projection). The three-phase decomposition ensures that the most perceptually important attribute — value — is locked in before hue and chroma are adjusted, just as it is in traditional painting practice.
+The four parameters (R_base, A, λ₀, σ) are fitted by minimising the CIE XYZ distance between the integrated spectrum and the palette colour under D65 illumination. Working in spectral K/S space means that any convex combination of palette K/S spectra corresponds to a physically realisable opaque paint mixture.
+
+### Optimisation
+
+For each pixel, the algorithm finds simplex weights c (cᵢ ≥ 0, Σcᵢ = 1) such that the K/S mixture ΣcᵢKSᵢ integrates to a colour as close as possible to the target in Oklab. This is solved with cosine-decayed [Adam](https://en.wikipedia.org/wiki/Stochastic_gradient_descent#Adam) gradient descent, with the weights re-projected onto the probability simplex after every step.
+
+### Initialisation and diversity
+
+Good initialisation is important: Adam can stall in local optima if weights start too close to a palette-edge one-hot vector. The pipeline addresses this in two steps:
+
+1. **Augmented palette snap** — the optimiser is initialised not just from the 17 pure palette colours but from an augmented set that includes all N(N−1)/2 pairwise 50/50 K/S mixtures. Pixels near colour-boundary regions are directly assigned interior-simplex starting weights rather than one-hot corners, avoiding the sharpest local optima from the start.
+
+2. **Random diversification** — the snapped weights are blended 50/50 with a Dirichlet-sampled random weight field, then re-projected onto the simplex. This scatters the initialisation away from the nearest palette entry, giving Adam room to explore a wider region of the loss landscape.
+
+The weights are then Gaussian-smoothed across image neighbours and re-projected, producing spatially coherent mixing in flat regions.

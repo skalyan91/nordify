@@ -40,7 +40,6 @@ python3 depth_blur.py <input> -o <blurred> [options]
 | `--align` | `center` | Crop alignment: `left`/`center`/`right`/`top`/`bottom` |
 | `--no-crop` | — | Skip aspect-ratio cropping |
 | `--blur PCT` | `2.0` | Max blur sigma as % of image height |
-| `--smooth PCT` | `1.0` | Depth-map smoothing sigma as % of image height |
 | `--power P` | `2.0` | Depth-to-blur curve exponent (`1`=linear, `2`=quadratic) |
 | `--invert-depth` | — | Blur background instead of foreground |
 | `--depth-only` | — | Save normalised depth map and exit |
@@ -57,7 +56,7 @@ python3 nordify.py <input> -o <output> [options]
 | Flag | Description |
 |------|-------------|
 | `--dither fs` | Floyd-Steinberg dithering with blue-noise seeding |
-| `--mix [MODEL]` | Palette mixing gamut mapping (requires MLX). `MODEL` is `additive` (default), `pigment`, or `opaque`; see [Methods](#palette-mixing---mix) below. |
+| `--mix` | Spectral palette mixing (requires MLX); see [Methods](#palette-mixing---mix) below. |
 | `--night` | Nighttime pre-processing: darken and cool the image before palette conversion |
 
 ### Examples
@@ -69,21 +68,19 @@ python3 nordify.py photo.jpg -o photo_nord.png
 # Floyd-Steinberg dithering
 python3 nordify.py photo.jpg -o photo_nord.png --dither fs
 
-# Palette mixing — additive (default), pigment, or opaque
+# Spectral palette mixing
 python3 nordify.py photo.jpg -o photo_nord.png --mix
-python3 nordify.py photo.jpg -o photo_nord.png --mix pigment
-python3 nordify.py photo.jpg -o photo_nord.png --mix opaque
 
-# Nighttime version with palette mixing
+# Nighttime version with spectral mixing
 python3 nordify.py photo.jpg -o photo_night.png --night --mix
 
-# Full wallpaper pipeline: 16:9 crop + depth blur, then nordify (opaque paint model)
-python3 depth_blur.py photo.jpg -o blurred.png --smooth 7
-python3 nordify.py blurred.png -o wallpaper.png --mix opaque
+# Full wallpaper pipeline: 16:9 crop + depth blur, then nordify
+python3 depth_blur.py photo.jpg -o blurred.png
+python3 nordify.py blurred.png -o wallpaper.png --mix
 
 # 3:2 wallpaper, keeping left side, heavier blur
 python3 depth_blur.py photo.jpg -o blurred.png --aspect 3:2 --align left --blur 4
-python3 nordify.py blurred.png -o wallpaper.png --mix opaque
+python3 nordify.py blurred.png -o wallpaper.png --mix
 ```
 
 ## Samples
@@ -97,13 +94,13 @@ Original photo by [Philippe Gauthier](https://unsplash.com/photos/orange-fruits-
 | **Floyd-Steinberg dithering** | **Nighttime (`--night`)** |
 | ![Dithered](samples/dithered.png) | ![Night](samples/night.png) |
 
-**Palette mixing — `--mix [additive|pigment|opaque]`:**
+**Palette mixing (`--mix`):**
 
-| `--mix additive` | `--mix pigment` | `--mix opaque` |
-|---|---|---|
-| ![Mixed additive](samples/mixed.png) | ![Mixed pigment](samples/mixed_pigment.png) | ![Mixed opaque](samples/mixed_opaque.png) |
+| `--mix` |
+|---|
+| ![Mixed spectral](samples/mixed_opaque.png) |
 
-**Wallpaper crop + depth blur + opaque palette mixing (`depth_blur.py --smooth 7` → `nordify.py --mix opaque`):**
+**Wallpaper crop + depth-dilation blur + spectral palette mixing (`depth_blur.py` → `nordify.py --mix`):**
 
 ![Wallpaper](samples/wallpaper.png)
 
@@ -119,38 +116,20 @@ Each pixel's colour is converted to [Oklab](https://bottosson.github.io/posts/ok
 
 ### Palette mixing (`--mix`)
 
-Palette mixing treats Nord colours like paints: any colour achievable by mixing them is the *palette gamut* — a [convex hull](https://en.wikipedia.org/wiki/Convex_hull) built in a colour space that matches the physical mixing model. Pixels already inside the gamut pass through unchanged; pixels outside are remapped to the nearest achievable colour.
+Spectral palette mixing fits a Gaussian reflectance spectrum to each Nord colour, then for every pixel optimises a simplex (Σcᵢ = 1) over the 17 palette K/S spectra to minimise Oklab distance to the target. Mixing in spectral K/S space follows Kubelka-Munk theory: convex combinations of K/S spectra correspond to physically realised opaque paint mixtures.
 
-Three mixing models are available via `--mix [MODEL]`:
+The pipeline:
 
-| Model | Space | Physical meaning |
-|-------|-------|-----------------|
-| `additive` (default) | Linear RGB | Mixing light beams; convex combinations are intensity-weighted averages |
-| `pigment` | log(linear RGB + ε) | Transparent pigments (watercolour, ink): Beer's law, T\_mix = T\_A^w · T\_B^(1−w) — midpoint mixtures are darker than the arithmetic mean |
-| `opaque` | Kubelka-Munk K/S = (1−R)²/2R | Opaque paints: K/S ratios mix linearly, giving the muddy midpoints characteristic of physical paint |
-
-Once the working space is chosen, out-of-gamut pixels are remapped via a three-phase [Adam](https://en.wikipedia.org/wiki/Stochastic_gradient_descent#Adam) optimisation in Oklab, mirroring how an artist builds up a painting:
-
-1. **Lightness first** — establish the light/dark structure (the *value sketch*).
-2. **Hue second** — lay in colour temperature and hue relationships.
-3. **Chroma last** — push or pull colour intensity while holding the value and hue already achieved.
-
-After every Adam step the colour is snapped back onto the hull boundary.
-
-#### Opaque model: phased optimisation
-
-Raw K/S values span 0–499 (pure white to pure black), making the hull poorly conditioned for gradient-based optimisation. The lightness phase therefore runs in two halves:
-
-1. **First half — log(1+K/S) space.** The reparameterisation compresses the range to [0, 6.2], giving the POCS snap and Adam well-conditioned steps throughout the reflectance range.
-2. **Second half — raw K/S space.** The point is converted to K/S, re-snapped onto the raw-K/S hull, and refined with strict Kubelka-Munk mixing as the final constraint.
-
-This gives smooth convergence (no posterisation) while ensuring the result satisfies exact K/S mixing theory.
+1. **Augmented palette** — the 17 pure colours plus all N(N−1)/2 pairwise 50/50 K/S mixtures are assembled. Each pixel is snapped to the nearest augmented entry; pairwise-mixture entries ensure boundary pixels receive interior-simplex starting weights rather than one-hot corners.
+2. **Random diversification** — the snapped weights are blended 50/50 with a Dirichlet-sampled random field, then re-projected onto the simplex. This prevents pixels near palette boundaries from stalling in local optima.
+3. **Spatial blur** — weights are Gaussian-smoothed across neighbours and re-projected, giving spatially coherent mixing in flat regions.
+4. **Adam optimisation** — cosine-decayed Adam refines the simplex weights per strip to minimise Oklab distance to the target.
 
 For a more detailed discussion of the algorithms and their artistic rationale, see [BACKGROUND.md](BACKGROUND.md).
 
 ### Depth-guided blur (`depth_blur.py`)
 
-Estimates monocular depth via [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) and builds a Gaussian blur pyramid. Each pixel is blended between pyramid levels according to its (smoothed, normalised) depth value raised to `--power`, so foreground objects receive strong blur while the background stays sharp. Blur and pyramid construction use MLX GPU acceleration on Apple Silicon when available.
+Estimates monocular depth via [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) and builds a Gaussian blur pyramid. Each pixel is blended between pyramid levels according to its depth value raised to `--power`, so foreground objects receive strong blur while the background stays sharp. Before blending, the normalised depth map is processed with a variable-radius morphological dilation: each depth level expands into its surroundings by a circle whose radius equals the 3-sigma truncation radius of the Gaussian blur assigned to that level. This prevents foreground edges from producing a thin halo of background-depth blur. Blur and pyramid construction use MLX GPU acceleration on Apple Silicon when available.
 
 ### Nighttime pre-processing (`--night`)
 
