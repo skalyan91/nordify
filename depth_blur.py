@@ -116,38 +116,28 @@ def _estimate_depth(image_bgr, model=_DEFAULT_MODEL):
                       interpolation=cv2.INTER_LINEAR)
 
 
-def _dilate_depth(depth_norm, sigma_max, n_levels):
-    """Soft depth-map dilation with cosine spatial falloff.
+def _dilate_depth(depth_norm, sigma_max, n_levels, power):
+    """Soft depth-map dilation with per-level Gaussian falloff tracking the blur.
 
-    Linearly-spaced radii r_k = r_max·k/K with sinusoidal weights w_k = sin(πk/K)
-    produce a cosine-shaped spatial gradient near foreground edges:
-        blend(δ) = d_bg + (d_fg − d_bg) · (1 + cos(π·δ/r_max)) / 2
-    Zero-derivative transitions at both the inner (δ=0) and outer (δ=r_max)
-    boundaries — smooth at both ends.  When multiple k values round to the same
-    integer radius their weights are accumulated before computing the weighted mean.
+    For each threshold t = k/K, Gaussian-blurs the binary mask (depth >= t)
+    with sigma = sigma_max * t^power — the same Gaussian used for the image
+    blur at that depth level.  The element-wise max of (t * blurred_mask) over
+    all levels creates foreground halos that:
+      - extend to ~3 * sigma(t) (standard Gaussian truncation = 3x blur radius)
+      - decay with the same Gaussian profile as the image blur at that depth.
+    Heavily-blurred foreground produces wide, soft halos; lightly-blurred
+    foreground produces narrow, crisp halos.
     """
-    r_max = sigma_max
     K = n_levels
-
-    radius_weight: dict = {}
-    for k in range(K + 1):
-        r = int(round(r_max * k / K))
-        w = float(np.sin(np.pi * k / K))
-        radius_weight[r] = radius_weight.get(r, 0.0) + w
-
-    total_w = sum(radius_weight.values())
-    result = np.zeros_like(depth_norm)
-    for r, w in sorted(radius_weight.items()):
-        if w == 0.0:
+    result = depth_norm.copy()
+    for k in range(1, K + 1):
+        t = k / K
+        sigma_k = sigma_max * (t ** power)
+        if sigma_k < 0.5:
             continue
-        if r == 0:
-            dilation = depth_norm
-        else:
-            ks = 2 * r + 1
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
-            dilation = cv2.dilate(depth_norm, kernel).astype(np.float32)
-        result += (w / total_w) * dilation
-
+        mask = (depth_norm >= t).astype(np.float32)
+        blurred = cv2.GaussianBlur(mask, (0, 0), sigma_k)
+        result = np.maximum(result, blurred * t)
     return result
 
 
@@ -170,7 +160,7 @@ def _depth_blur(image, depth_raw, sigma_max, n_levels=_N_BLUR_LEVELS, power=2.0)
         depth = np.zeros_like(depth_raw)
 
     print(f"  [blur] dilating depth map …", file=sys.stderr, flush=True)
-    depth = _dilate_depth(depth, sigma_max, n_levels)
+    depth = _dilate_depth(depth, sigma_max, n_levels, power)
 
     img_lin = _srgb_to_linear(image.astype(np.float32) / 255.0)
 

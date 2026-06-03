@@ -98,7 +98,7 @@ Original photo by [Philippe Gauthier](https://unsplash.com/photos/orange-fruits-
 
 | `--mix` |
 |---|
-| ![Mixed spectral](samples/mixed_opaque.png) |
+| ![Mixed spectral](samples/mixed.png) |
 
 **Wallpaper crop + depth-dilation blur + spectral palette mixing (`depth_blur.py` → `nordify.py --mix`):**
 
