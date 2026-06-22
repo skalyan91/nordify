@@ -36,6 +36,8 @@ Two scripts: `depth_blur.py` (preprocessing) and `nordify.py` (palette conversio
 
 **`PALETTE_BGR`** — 17 colours: black `(0,0,0)` plus nord0–nord15 in BGR order (Polar Night × 4, Snow Storm × 3, Frost × 4, Aurora × 5). Black extends the lightness range for `--mix`.
 
+**`_fit_palette_ks()`** — fits a reflectance spectrum to each palette colour. Spectral colours (single dominant channel) get a single Gaussian `R_base + A·exp(−(λ−λ₀)²/2σ²)`. Extra-spectral colours (purple/magenta: `g < r AND g < b`) use a **bi-Gaussian** with one red lobe (λ ∈ [560, 700] nm) and one blue/violet lobe (λ ∈ [400, 490] nm) — physically necessary because purple cannot be produced by any single wavelength.
+
 **`build_lookup()`** — converts each palette entry to Oklab `(L, a, b)` and Oklch hue `H = arctan2(b, a)`; called once at startup.
 
 ### Conversion (`convert`)

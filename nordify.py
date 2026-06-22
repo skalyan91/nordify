@@ -153,10 +153,16 @@ _PALETTE_KS: np.ndarray | None = None  # (N_palette, 31) K/S spectra, fitted on 
 
 
 def _fit_palette_ks():
-    """Fit a Gaussian reflectance model to each palette colour.
+    """Fit a reflectance model to each palette colour.
 
-    Model: R(λ) = clip(R_base + A·exp(−(λ−λ₀)²/2σ²), KM_EPS, 1)
-    Fits R_base, A, λ₀, σ per colour so that XYZ under D65 matches the sRGB target.
+    Spectral colours use a single Gaussian:
+      R(λ) = clip(R_base + A·exp(−(λ−λ₀)²/2σ²), KM_EPS, 1)
+
+    Extra-spectral colours (purple/magenta: g < r AND g < b) use a bi-Gaussian
+    with one red lobe (λ ∈ [560, 700] nm) and one blue/violet lobe (λ ∈ [400, 490] nm).
+    A single Gaussian cannot simultaneously stimulate the L and S cones while
+    leaving the M cone depressed; the bi-Gaussian is the physically correct model.
+
     Returns (N_palette, 31) float32 K/S ratios.
     """
     lam    = _LAMBDA.astype(np.float64)
@@ -181,20 +187,42 @@ def _fit_palette_ks():
         b_lin = float(_srgb_to_linear(b8 / 255.0))
         xyz_tgt = np.array([r_lin, g_lin, b_lin]) @ _M_RGB_TO_XYZ.T.astype(np.float64)
 
-        def loss(p, xyz_tgt=xyz_tgt):
-            Rb, A, l0, sg = p
-            R = np.clip(Rb + A * np.exp(-(lam - l0)**2 / (2.0 * sg**2)), KM_EPS, 1.0)
-            return float(((_xyz_from_refl(R) - xyz_tgt)**2).sum())
+        # Purple/magenta: green is the minimum channel → extra-spectral.
+        # Needs one red lobe + one blue/violet lobe.
+        is_extraspectral = (g_lin < r_lin) and (g_lin < b_lin)
 
-        if r_lin >= g_lin and r_lin >= b_lin:
-            l0_init = 620.0
-        elif g_lin >= r_lin and g_lin >= b_lin:
-            l0_init = 540.0
+        if is_extraspectral:
+            def loss(p, xyz_tgt=xyz_tgt):
+                Rb, Ar, lr_, sgr, Ab, lb_, sgb = p
+                R = np.clip(
+                    Rb
+                    + Ar * np.exp(-(lam - lr_)**2 / (2.0 * sgr**2))
+                    + Ab * np.exp(-(lam - lb_)**2 / (2.0 * sgb**2)),
+                    KM_EPS, 1.0)
+                return float(((_xyz_from_refl(R) - xyz_tgt)**2).sum())
+
+            brightness = (r_lin + g_lin + b_lin) / 3.0
+            x0   = [max(0.02, brightness * 0.1),
+                    max(0.02, r_lin * 0.9), 625.0, 40.0,
+                    max(0.02, b_lin * 0.9), 445.0, 40.0]
+            bnds = [(0.0, 0.99),
+                    (0.0, 0.99), (560.0, 700.0), (20.0, 100.0),
+                    (0.0, 0.99), (400.0, 490.0), (20.0, 100.0)]
         else:
-            l0_init = 460.0
-        brightness = (r_lin + g_lin + b_lin) / 3.0
-        x0   = [max(0.02, brightness * 0.2), max(0.02, brightness * 0.8), l0_init, 60.0]
-        bnds = [(0.0, 0.99), (0.0, 0.99), (400.0, 700.0), (20.0, 150.0)]
+            def loss(p, xyz_tgt=xyz_tgt):
+                Rb, A, l0, sg = p
+                R = np.clip(Rb + A * np.exp(-(lam - l0)**2 / (2.0 * sg**2)), KM_EPS, 1.0)
+                return float(((_xyz_from_refl(R) - xyz_tgt)**2).sum())
+
+            if r_lin >= g_lin and r_lin >= b_lin:
+                l0_init = 620.0
+            elif g_lin >= r_lin and g_lin >= b_lin:
+                l0_init = 540.0
+            else:
+                l0_init = 460.0
+            brightness = (r_lin + g_lin + b_lin) / 3.0
+            x0   = [max(0.02, brightness * 0.2), max(0.02, brightness * 0.8), l0_init, 60.0]
+            bnds = [(0.0, 0.99), (0.0, 0.99), (400.0, 700.0), (20.0, 150.0)]
 
         if _have_scipy:
             res    = _sp_min(loss, x0, method='L-BFGS-B', bounds=bnds,
@@ -210,7 +238,7 @@ def _fit_palette_ks():
                 if lv < best_l:
                     best_l, p_best = lv, x.copy()
             for _ in range(100):
-                for j in range(4):
+                for j in range(len(bnds)):
                     for frac in [0.05, 0.005]:
                         for s in (1, -1):
                             lo, hi = bnds[j]
@@ -220,8 +248,17 @@ def _fit_palette_ks():
                             if lv < best_l:
                                 best_l, p_best = lv, xn
 
-        Rb, A, l0, sg = p_best
-        R_fit  = np.clip(Rb + A * np.exp(-(lam - l0)**2 / (2.0 * sg**2)), KM_EPS, 1.0)
+        if is_extraspectral:
+            Rb, Ar, lr_, sgr, Ab, lb_, sgb = p_best
+            R_fit = np.clip(
+                Rb
+                + Ar * np.exp(-(lam - lr_)**2 / (2.0 * sgr**2))
+                + Ab * np.exp(-(lam - lb_)**2 / (2.0 * sgb**2)),
+                KM_EPS, 1.0)
+        else:
+            Rb, A, l0, sg = p_best
+            R_fit = np.clip(Rb + A * np.exp(-(lam - l0)**2 / (2.0 * sg**2)), KM_EPS, 1.0)
+
         pal_ks[i] = ((1.0 - R_fit)**2 / (2.0 * R_fit)).astype(np.float32)
 
     return pal_ks
@@ -428,53 +465,33 @@ def _mix_strip_spectral(strip_bgr, palette_ks_mx, D65n_cmf_mx, M_xyz2rgb_mx,
         b_ = 0.0259040371*l_ + 0.4072165126*m_ - 0.4331205297*s_
         return mx.stack([L, a, b_], axis=-1)
 
-    def loss_fn(c):
-        oklab_loss = ((target - _forward(c)) ** 2).mean()
-        if anchor_mx is None:
-            return oklab_loss
-        reg = ((c - anchor_mx) ** 2).mean()
-        return oklab_loss + reg_lambda * reg
+    def _reg(c):
+        return reg_lambda * ((c - anchor_mx) ** 2).mean() if anchor_mx is not None else 0.0
 
-    lag  = mx.value_and_grad(loss_fn)
-    prev = float('inf')
+    def loss_single(c):
+        pred = _forward(c)
+        return ((target - pred)**2).mean() + _reg(c)
 
-    if optimizer == 'gd':
-        # Gradient descent with per-pixel clipping (max norm 1.0).
-        # Step size is proportional to gradient magnitude: flat/blurred pixels
-        # take tiny steps and stay close together → no grain.
-        lr = 0.05
-        for step in range(1, max_iters + 1):
-            val, grad = lag(c)
-            g_norm  = mx.sqrt((grad * grad).sum(axis=-1, keepdims=True) + 1e-12)
-            clipped = grad * mx.minimum(1.0 / g_norm, 1.0)
-            c = _simplex_project_mlx(c - lr * clipped)
-            mx.eval(c, val)
-            curr = float(val)
-            if abs(curr - prev) < tol:
-                break
-            prev = curr
-    else:
-        # Cosine-decayed learning rate: starts at adam_lr (enough to separate
-        # smeared light colours early), anneals to adam_lr*lr_final_frac so the
-        # final iterations settle without overshooting into per-pixel grain.
+    def _adam_run(loss_fn, c, n_steps, phase_label):
         lr0, b1, b2, eps_a = adam_lr, 0.9, 0.999, 1e-8
         lr_min = adam_lr * lr_final_frac
-        denom  = max(max_iters - 1, 1)
-        m_a = mx.zeros((M, N_pal))
-        v_a = mx.zeros((M, N_pal))
-        t0 = time.time()
-        for step in range(1, max_iters + 1):
+        denom  = max(n_steps - 1, 1)
+        m_a    = mx.zeros((M, N_pal))
+        v_a    = mx.zeros((M, N_pal))
+        lag    = mx.value_and_grad(loss_fn)
+        prev   = float('inf')
+        t0     = time.time()
+        for step in range(1, n_steps + 1):
             lr = lr_min + 0.5 * (lr0 - lr_min) * (1.0 + math.cos(math.pi * (step - 1) / denom))
             val, grad = lag(c)
             m_a   = b1 * m_a + (1.0 - b1) * grad
             v_a   = b2 * v_a + (1.0 - b2) * grad * grad
-            c_new = c - lr * (m_a / (1.0 - b1**step)) / (mx.sqrt(v_a / (1.0 - b2**step)) + eps_a)
-            c     = _simplex_project_mlx(c_new)
+            c     = _simplex_project_mlx(c - lr * (m_a / (1.0 - b1**step)) / (mx.sqrt(v_a / (1.0 - b2**step)) + eps_a))
             mx.eval(c, m_a, v_a, val)
             curr  = float(val)
-            if progress_label is not None and (step % 10 == 0 or step == max_iters):
+            if progress_label is not None and (step % 10 == 0 or step == n_steps):
                 ips = step / (time.time() - t0 + 1e-9)
-                print(f"\r  [mix] {progress_label} step {step:4d}/{max_iters} "
+                print(f"\r  [mix] {progress_label} {phase_label} step {step:4d}/{n_steps} "
                       f"loss={curr:.6f} ({ips:5.1f} it/s)   ",
                       end="", file=sys.stderr, flush=True)
             if abs(curr - prev) < tol:
@@ -482,6 +499,23 @@ def _mix_strip_spectral(strip_bgr, palette_ks_mx, D65n_cmf_mx, M_xyz2rgb_mx,
             prev = curr
         if progress_label is not None:
             print(file=sys.stderr, flush=True)
+        return c
+
+    if optimizer == 'gd':
+        lag = mx.value_and_grad(lambda c: ((target - _forward(c))**2).mean() + _reg(c))
+        prev = float('inf')
+        lr   = 0.05
+        for step in range(1, max_iters + 1):
+            val, grad = lag(c)
+            g_norm  = mx.sqrt((grad * grad).sum(axis=-1, keepdims=True) + 1e-12)
+            clipped = grad * mx.minimum(1.0 / g_norm, 1.0)
+            c = _simplex_project_mlx(c - lr * clipped)
+            mx.eval(c, val)
+            if abs(float(val) - prev) < tol:
+                break
+            prev = float(val)
+    else:
+        c = _adam_run(loss_single, c, max_iters, '')
 
     return np.array(c)   # (M, N_pal) float32 simplex weights
 
