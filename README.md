@@ -1,6 +1,6 @@
 # nordify
 
-Convert any image to the [Nord colour palette](https://www.nordtheme.com/). Colour snapping and dithering operate in the perceptually-uniform [Oklab](https://bottosson.github.io/posts/oklab/) colour space; palette mixing maps pixels onto a convex hull whose geometry varies by mixing model (additive, pigment, or opaque paint).
+Convert any image to the [Nord colour palette](https://www.nordtheme.com/). Colour snapping and dithering operate in the perceptually-uniform [Oklab](https://bottosson.github.io/posts/oklab/) colour space; palette mixing maps pixels onto a convex hull whose geometry varies by mixing model (spectral Kubelka-Munk pigment mixing, or linear-RGB additive light mixing).
 
 ## Installation
 
@@ -28,7 +28,7 @@ depth_blur.py  →  nordify.py
 
 ### Step 1 — `depth_blur.py`
 
-Crops to a target aspect ratio, estimates monocular depth, and applies a depth-guided Gaussian blur (foreground blurred most, background least).
+Crops to a target aspect ratio, estimates monocular depth, and applies a depth-guided defocus (bokeh) blur via layered forward-scatter compositing.
 
 ```
 python3 depth_blur.py <input> -o <blurred> [options]
@@ -39,10 +39,10 @@ python3 depth_blur.py <input> -o <blurred> [options]
 | `--aspect W:H` | `16:9` | Crop aspect ratio |
 | `--align` | `center` | Crop alignment: `left`/`center`/`right`/`top`/`bottom` |
 | `--no-crop` | — | Skip aspect-ratio cropping |
-| `--blur PCT` | `2.0` | Max blur sigma as % of image height |
-| `--power P` | `2.0` | Depth-to-blur curve exponent (`1`=linear, `2`=quadratic) |
-| `--invert-depth` | — | Blur background instead of foreground |
-| `--depth-only` | — | Save normalised depth map and exit |
+| `--blur PCT` | `2.0` | Max disc radius (circle of confusion) as % of image height |
+| `--levels N` | `16` | Number of depth slabs for scatter compositing |
+| `--focus D` | `0.0` | Focus plane as normalised disparity: `0.0`=background/infinity, `1.0`=foreground |
+| `--depth-only` | — | Save the blur-strength map and exit (useful for tuning) |
 | `--model MODEL` | Depth Anything V2 Small | HuggingFace depth model ID |
 
 ### Step 2 — `nordify.py`
@@ -56,7 +56,7 @@ python3 nordify.py <input> -o <output> [options]
 | Flag | Description |
 |------|-------------|
 | `--dither fs` | Floyd-Steinberg dithering with blue-noise seeding |
-| `--mix` | Spectral palette mixing (requires MLX); see [Methods](#palette-mixing---mix) below. |
+| `--mix [spectral\|additive]` | Palette mixing (requires MLX); see [Methods](#palette-mixing---mix) below. |
 | `--night` | Nighttime pre-processing: darken and cool the image before palette conversion |
 
 ### Examples
@@ -70,6 +70,9 @@ python3 nordify.py photo.jpg -o photo_nord.png --dither fs
 
 # Spectral palette mixing
 python3 nordify.py photo.jpg -o photo_nord.png --mix
+
+# Additive (linear-light) palette mixing
+python3 nordify.py photo.jpg -o photo_nord.png --mix additive
 
 # Nighttime version with spectral mixing
 python3 nordify.py photo.jpg -o photo_night.png --night --mix
@@ -96,11 +99,11 @@ Original photo by [Philippe Gauthier](https://unsplash.com/photos/orange-fruits-
 
 **Palette mixing (`--mix`):**
 
-| `--mix` |
-|---|
-| ![Mixed spectral](samples/mixed.png) |
+| `--mix spectral` (default) | `--mix additive` |
+|---|---|
+| ![Mixed spectral](samples/mixed.png) | ![Mixed additive](samples/mixed_additive.png) |
 
-**Wallpaper crop + depth-dilation blur + spectral palette mixing (`depth_blur.py` → `nordify.py --mix`):**
+**Wallpaper crop + depth-guided defocus blur + spectral palette mixing (`depth_blur.py` → `nordify.py --mix`):**
 
 ![Wallpaper](samples/wallpaper.png)
 
@@ -116,7 +119,9 @@ Each pixel's colour is converted to [Oklab](https://bottosson.github.io/posts/ok
 
 ### Palette mixing (`--mix`)
 
-Spectral palette mixing fits a Gaussian reflectance spectrum to each Nord colour, then for every pixel optimises a simplex (Σcᵢ = 1) over the 17 palette K/S spectra to minimise Oklab distance to the target. Mixing in spectral K/S space follows Kubelka-Munk theory: convex combinations of K/S spectra correspond to physically realised opaque paint mixtures.
+Two mixing models, both minimising Oklab distance to each pixel's original colour and both leaving already-reachable pixels unchanged.
+
+**`--mix spectral` (default)** fits a Gaussian reflectance spectrum to each Nord colour, then for every pixel optimises a simplex (Σcᵢ = 1) over the 17 palette K/S spectra to minimise Oklab distance to the target. Mixing in spectral K/S space follows Kubelka-Munk theory: convex combinations of K/S spectra correspond to physically realised opaque paint mixtures.
 
 The pipeline:
 
@@ -125,11 +130,13 @@ The pipeline:
 3. **Spatial blur** — weights are Gaussian-smoothed across neighbours and re-projected, giving spatially coherent mixing in flat regions.
 4. **Adam optimisation** — cosine-decayed Adam refines the simplex weights per strip to minimise Oklab distance to the target.
 
+**`--mix additive`** treats the palette as a set of light sources instead of pigments: the reachable gamut is the convex hull of the 17 colours (plus black and white) in **linear RGB**, which — unlike the K/S spectral gamut — includes ordinary additive colour mixing. Out-of-gamut pixels are first clamped onto this hull, then walked back toward their original colour in Oklab space in two sequential phases — luminance, then chrominance (hue and chroma matched jointly) — each phase run with Adam. Every step's candidate is re-projected onto the hull, so the effective step is always the gradient clamped to the gamut boundary rather than a raw unconstrained step. Because the additive gamut is much larger than the pigment gamut, this model changes photographs more subtly than spectral mixing — visible mainly on strongly saturated or overexposed pixels.
+
 For a more detailed discussion of the algorithms and their artistic rationale, see [BACKGROUND.md](BACKGROUND.md).
 
 ### Depth-guided blur (`depth_blur.py`)
 
-Estimates monocular depth via [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) and builds a Gaussian blur pyramid. Each pixel is blended between pyramid levels according to its depth value raised to `--power`, so foreground objects receive strong blur while the background stays sharp. Before blending, the normalised depth map is processed with a variable-radius morphological dilation: each depth level expands into its surroundings by a circle whose radius equals the 3-sigma truncation radius of the Gaussian blur assigned to that level. This prevents foreground edges from producing a thin halo of background-depth blur. Blur and pyramid construction use MLX GPU acceleration on Apple Silicon when available.
+Estimates monocular depth via [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) and applies a telecentric defocus (bokeh) model via layered forward-scatter compositing. The depth map is divided into `--levels` slabs with tent-function membership (an exact partition of unity); each slab forward-scatters its own colour and coverage outward by a disc (pillbox) kernel sized to that slab's circle of confusion — `r = sigma_max · |d − d_focus| / denom` — exactly as a real aperture spreads light from an out-of-focus point. Slabs are then composited front-to-back with premultiplied alpha, so nearer slabs occlude farther ones. Because blur is scattered from each source pixel outward rather than gathered into each output pixel from a neighbourhood sized by its own depth, background bokeh naturally bleeds up to (and is naturally clipped by) sharp foreground edges, and a blurred foreground naturally bleeds semi-transparently over a sharp background — with no heuristic depth dilation needed. Blur runs in linear light with MLX GPU acceleration on Apple Silicon when available.
 
 ### Nighttime pre-processing (`--night`)
 

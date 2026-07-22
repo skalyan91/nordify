@@ -12,10 +12,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 source venv/bin/activate
 
 # Step 1 — crop + depth-guided blur
-python3 depth_blur.py <input> -o <blurred> [--aspect W:H] [--align ...] [--blur PCT] [--smooth PCT] [--power P]
+python3 depth_blur.py <input> -o <blurred> [--aspect W:H] [--align ...] [--blur PCT] [--focus D]
 
 # Step 2 — nordify
-python3 nordify.py <blurred> -o <output> [--dither fs] [--mix]
+python3 nordify.py <blurred> -o <output> [--dither fs] [--mix [spectral|additive]]
 ```
 
 Core dependencies: `numpy`, `opencv-python-headless` (in `venv/`).  
@@ -60,16 +60,15 @@ The hue is snapped: the palette entry chosen by the dithering mode determines `H
 
 ### Palette mixing (`--mix`)
 
-**`_halfspace_eqs(points)`** — computes the half-space representation of the convex hull of `points` (N, 3). O(N⁴) brute force; fine for N ≤ 20 entries.
+Two interchangeable models, both MLX-only and both leaving in-hull/in-simplex pixels unchanged.
 
-**`mix_convert(image)`** — entry point for `--mix`. Clamps image pixel chroma to the palette's Oklab chroma range `[C_min, C_max]` as preprocessing (scaling `a`/`b` in Oklab, converting back to linear RGB), then builds RGB hull equations once and processes the image in 256-row strips via `_mix_strip`.
+**`--mix spectral` (default) — `mix_convert_spectral(image)`.** Fits a Gaussian (or bi-Gaussian) reflectance spectrum to each palette colour via `_fit_palette_ks()`, then for every pixel optimises a simplex of weights (Σcᵢ = 1) over the palette's K/S spectra to minimise Oklab distance to the target, mixing via Kubelka-Munk. Builds an augmented palette (pure colours + all pairwise 50/50 K/S mixtures), snaps each pixel to the nearest augmented entry, blurs, and re-snaps to seed the simplex weights before a phased Adam optimisation (`_mix_strip_spectral`) run strip-by-strip; `_simplex_project_mlx` projects onto the probability simplex after every step.
 
-**`_mix_strip(strip_lin, hull_eqs)`** — optimises out-of-hull pixels in linear RGB space via three sequential Adam phases:
-- **Phase 1 (lightness):** minimises `(L − L_target)²`
-- **Phase 2 (hue):** minimises cross-product hue error + 1000 × L penalty
-- **Phase 3 (chroma):** minimises `(C − C_target)²` + 1000 × hue + 1000 × L penalties
+**`--mix additive` — `mix_convert_additive(image)`.** Convex hull of the palette in **linear RGB** (light/additive mixing), represented as half-spaces via `_halfspace_eqs(points)` (O(N⁴) brute force; fine for N ≤ 20 entries). Per pixel (`_mix_strip_additive`), out-of-hull colours are first clamped onto the hull, then walked back toward the pixel's original colour in Oklab space via a **two-phase Adam optimisation**:
+- **Phase 1 (luminance):** minimises `(L − L_target)²`
+- **Phase 2 (chrominance):** minimises `(a − a_target)² + (b − b_target)²` (hue and chroma jointly) + 1000 × luminance penalty
 
-After every Adam step, `snap()` projects the colour onto the RGB convex hull via 20 iterations of half-space projection (no GPU sync — fully fused MLX graph). In-hull pixels are returned unchanged. All GPU computation runs on MLX (Apple Silicon).
+After every Adam step, the candidate is re-projected onto the hull (20 iterations of half-space projection) — so the effective, gamut-clamped step is `projected_candidate − colour`, not the raw Adam update. Adam's per-coordinate adaptivity is needed because phase 2's penalty term makes the loss ill-conditioned; plain gradient descent stalls on it. (An earlier three-phase variant — luminance, then hue, then chroma sequentially — converges to a similar result but needs far more iterations per pixel, since splitting hue and chroma sharpens that ill-conditioning further.) In-hull pixels are skipped entirely (zero gradient at the target). All GPU computation stays on MLX (Apple Silicon) — no host/device round-trips inside the optimisation loop beyond the scalar loss used for convergence/progress checks.
 
 ## depth_blur.py
 
@@ -85,6 +84,8 @@ Preprocessing script: crop → depth estimation → depth-guided blur.
 
 ### Depth-guided blur
 
-**`_gaussian_blur_mlx(img_lin, sigma)`** — separable Gaussian blur on GPU via MLX depthwise `conv2d` (two passes: horizontal then vertical). Reflect-pads in NumPy before passing to MLX. Falls back to `cv2.GaussianBlur(..., borderType=BORDER_REFLECT_101)` if MLX is unavailable.
+**`_make_disc_kernel(radius)`** — builds a normalised uniform disc (pillbox) kernel with a 1-pixel anti-aliased edge ramp (`clip(radius − dist + 0.5, 0, 1)`). Returns a 1×1 identity when `radius < 0.5`.
 
-**`_depth_blur(image, depth_raw, sigma_max, n_levels, smooth_sigma, power)`** — builds an `n_levels`-deep Gaussian blur pyramid (`σᵢ = σ_max·i/N`, all in linear light). Pipeline: smooth depth map → normalise to `[0, 1]` → `depth^power` → interpolate between pyramid levels. Default `power=2` (quadratic) keeps the middle ground relatively sharp while blurring foreground strongly. `--invert-depth` flips the map to blur background instead. `--depth-only` saves the normalised depth map as greyscale for inspection.
+**`_disc_blur_mlx(img, radius)`** / **`_disc_blur_cpu(img, radius)`** — disc blur for `(H, W, C)` arrays (any C) on GPU via MLX 2-D depthwise `conv2d` (weight shape `(C, kH, kW, 1)`, `groups=C`) or CPU via `cv2.filter2D`. Both reflect-pad at boundaries.
+
+**`_depth_blur(image, depth_raw, sigma_max, d_focus=0.0, n_levels=16)`** — **layered forward-scatter compositing**. Divides depth into K=`n_levels` slabs with tent-function membership (exact partition of unity). For each slab k (front-to-back order, foreground first): packs `image × mask_k` and `mask_k` as a 4-channel array, blurs with disc radius `rₖ = sigma_max · |dₖ − d_focus| / max(d_focus, 1−d_focus)` (telecentric CoC), then composites with premultiplied alpha (`color_acc += remaining · color_k`, `weight_acc += remaining · alpha_k`). Background bokeh circles at foreground edges emerge naturally from the forward scatter — no depth dilation needed. Un-premultiplies at the end (`result / weight_acc`). `--depth-only` saves the blur-strength map `|d − d_focus| / denom` (white = max blur, black = in-focus plane).

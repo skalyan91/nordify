@@ -71,3 +71,28 @@ Good initialisation is important: Adam can stall in local optima if weights star
 2. **Random diversification** — the snapped weights are blended 50/50 with a Dirichlet-sampled random weight field, then re-projected onto the simplex. This scatters the initialisation away from the nearest palette entry, giving Adam room to explore a wider region of the loss landscape.
 
 The weights are then Gaussian-smoothed across image neighbours and re-projected, producing spatially coherent mixing in flat regions.
+
+## Palette mixing (`--mix additive`): linear-light convex hull
+
+### Physical basis
+
+Kubelka-Munk mixing models paint: pigments that absorb and scatter light, mixed by physically stirring them together. But not every medium works that way. Point two coloured stage lights at the same patch of wall and their illuminance simply adds — the physics of *additive* colour mixing, the same process at work when a screen's red, green, and blue subpixels blend into a full-colour image, or when overlapping torch beams wash out to white. In linear RGB — light intensity before the sRGB gamma curve is applied — a convex combination of colours corresponds exactly to this kind of physically realisable light mixture. So `--mix additive` builds its gamut as the convex hull of the 17 Nord colours (plus black and white, to extend the reachable lightness range) directly in linear RGB, rather than in Kubelka-Munk's spectral K/S space.
+
+This gamut is a much more generous one than the pigment gamut of `--mix spectral`: mixing light rarely darkens or desaturates the way mixing paint does, so a far greater share of an ordinary photograph already falls inside it. In practice this means `--mix additive` tends to leave more of an image untouched and shifts the remainder more subtly than the spectral model — visible mainly on strongly saturated or overexposed pixels.
+
+### Gamut as half-spaces
+
+A convex hull in three dimensions can be represented as the intersection of half-spaces — one inequality nx·x + ny·y + nz·z + d ≤ 0 per face, satisfied by every point inside the hull. `_halfspace_eqs` builds this representation by brute force: every triple of palette points defines a candidate plane, kept only if every other point lies on one side of it. With 19 points (17 colours plus black and white) this is a few thousand triples — cheap to compute once and reuse for every pixel.
+
+Projecting an arbitrary colour onto the hull is then an iterative process: find the most-violated face, push the point back onto it, and repeat. Twenty iterations is enough to converge for a shape this simple, and the whole loop runs as ordinary MLX tensor arithmetic — no per-pixel branching, no host round-trips.
+
+### Optimisation: two-phase, gamut-clamped
+
+Simply projecting each out-of-gamut pixel onto its nearest point on the hull would work, but "nearest" in linear RGB is not perceptually meaningful — Euclidean distance there does not track how different two colours *look*. Instead, `--mix additive` first projects onto the hull (a reasonable starting point, and a no-op for pixels already inside), then spends its optimisation budget walking that starting point back toward the original colour's appearance in Oklab, split into two phases:
+
+1. **Luminance** — minimise (L − L_target)², matching the target's lightness.
+2. **Chrominance** — minimise (a − a_target)² + (b − b_target)² (hue and chroma matched jointly, since both live in the same (a, b) plane), with a 1000× penalty on drifting away from the luminance already achieved in phase 1.
+
+An earlier attempt split chrominance further, into a hue phase and then a chroma phase run sequentially — mirroring the phase structure historically used for Kubelka-Munk mixing above. It converges to a similar-looking result, but far more slowly: separating hue from chroma means each phase's loss carries its own 1000× penalty term guarding the phase(s) before it, and that layered ill-conditioning needs many more optimiser steps to settle. Matching (a, b) jointly sidesteps the problem, since hue and chroma are just polar coordinates of the same two numbers — there is no reason to solve for them one at a time.
+
+Each phase runs [Adam](https://en.wikipedia.org/wiki/Stochastic_gradient_descent#Adam), whose per-coordinate adaptivity is what makes the penalty term tractable at all — plain gradient descent, tried first, stalled badly on phase 2's ill-conditioned loss. But an unconstrained Adam step could easily propose a colour outside the gamut again. So after every step, the candidate colour is re-projected onto the hull via the same half-space projection used for initialisation — meaning the *effective* step taken is not the raw Adam update but (projected candidate − current colour): whatever part of the update would have left the gamut is silently clipped away, and optimisation continues from wherever that leaves the pixel. This is the same principle as projected gradient descent in convex optimisation: take an ordinary step, then project back onto the feasible set, repeat.

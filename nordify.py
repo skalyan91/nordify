@@ -390,6 +390,38 @@ def _simplex_project_mlx(c):
     return mx.maximum(c - theta, 0.0)
 
 
+def _halfspace_eqs(points):
+    """Half-space representation of the convex hull of 'points' (N, 3).
+
+    Each row [nx, ny, nz, d] of the returned (F, 4) array satisfies
+    nx*x + ny*y + nz*z + d <= 0 for all x inside the hull.
+    O(N^4) — fine for small N (N = 18 palette entries).
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    N   = len(pts)
+    centroid = pts.mean(axis=0)
+    eqs = []
+    for i in range(N):
+        for j in range(i + 1, N):
+            for k in range(j + 1, N):
+                v1 = pts[j] - pts[i]
+                v2 = pts[k] - pts[i]
+                n  = np.cross(v1, v2)
+                nrm = np.linalg.norm(n)
+                if nrm < 1e-10:
+                    continue
+                n /= nrm
+                d = float(-n @ pts[i])
+                # Valid face: every point is on the non-positive side
+                if not np.all(pts @ n + d <= 1e-8):
+                    continue
+                # Orient normal outward from centroid
+                if float(n @ centroid) + d > 0:
+                    n, d = -n, -d
+                eqs.append(np.append(n, d).astype(np.float32))
+    return np.array(eqs, dtype=np.float32) if eqs else np.zeros((0, 4), dtype=np.float32)
+
+
 def _mix_strip_spectral(strip_bgr, palette_ks_mx, D65n_cmf_mx, M_xyz2rgb_mx,
                         c_anchor=None, reg_lambda=0.05,
                         max_iters=500, tol=1e-5, optimizer='adam', adam_lr=0.02,
@@ -458,7 +490,7 @@ def _mix_strip_spectral(strip_bgr, palette_ks_mx, D65n_cmf_mx, M_xyz2rgb_mx,
         l = 0.4122214708*r + 0.5363325363*g + 0.0514459929*b
         m = 0.2119034982*r + 0.6806995451*g + 0.1073969566*b
         s = 0.0883024619*r + 0.2817188376*g + 0.6299787005*b
-        def cbrt(x): return mx.sign(x) * (mx.abs(x) + 1e-10)**(1.0/3.0)
+        def cbrt(x): return (x + 1e-8)**(1.0/3.0)
         l_, m_, s_ = cbrt(l), cbrt(m), cbrt(s)
         L  = 0.2104542553*l_ + 0.7936177850*m_ - 0.0040720468*s_
         a  = 1.9779984951*l_ - 2.4285922050*m_ + 0.4505937099*s_
@@ -679,6 +711,188 @@ def mix_convert_spectral(image, strip_h=256,
     return np.clip(bgr.reshape(rows, cols, 3) * 255.0, 0, 255).astype(np.uint8)
 
 
+def _mix_strip_additive(strip_lin, hull_eqs, max_iters=300, lr=0.02, tol=1e-6,
+                        progress_label=None):
+    """Projected gradient descent in linear RGB, minimising Oklab distance to target.
+
+    Pixels are first projected onto the palette's convex hull in linear RGB
+    (a no-op for pixels already inside it — only out-of-hull pixels are
+    processed). Optimisation then proceeds in two sequential phases —
+    luminance, then chrominance (a, b jointly) — each running up to
+    max_iters steps. Every step computes the analytic gradient of that
+    phase's loss, proposes color - lr*grad, then projects that candidate
+    back onto the hull via the half-space representation — so the
+    effective, gamut-clamped step is (projected_candidate - color) rather
+    than the raw gradient step.
+
+    strip_lin : (M, 3) float32 — pixel values in linear RGB (R, G, B).
+    hull_eqs  : (F, 4) float32 — half-space equations in linear RGB space.
+    Returns   : (M, 3) float32 — optimised linear RGB values.
+    """
+    import mlx.core as mx
+
+    M = strip_lin.shape[0]
+
+    if hull_eqs.shape[0] > 0:
+        in_hull = (strip_lin @ hull_eqs[:, :3].T + hull_eqs[:, 3] <= 1e-6).all(axis=-1)
+    else:
+        in_hull = np.ones(M, dtype=bool)
+
+    out = strip_lin.copy()
+    rem = np.where(~in_hull)[0]
+    if len(rem) == 0:
+        return out
+
+    normals = mx.array(hull_eqs[:, :3])
+    d_vals  = mx.array(hull_eqs[:, 3])
+
+    def _project(c):
+        for _ in range(20):
+            v      = c @ normals.T + d_vals[None, :]
+            per_px = mx.max(v, axis=-1)
+            worst  = mx.argmax(v, axis=-1)
+            c      = c - mx.maximum(per_px, 0.0)[:, None] * normals[worst]
+        return mx.clip(c, 0.0, 1.0)
+
+    def _oklab(rgb):
+        r, g, b = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+        l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
+        m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
+        s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
+        def cbrt(x):
+            return (x + 1e-8) ** (1.0 / 3.0)
+        l_, m_, s_ = cbrt(l), cbrt(m), cbrt(s)
+        L  = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_
+        a  = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_
+        b_ = 0.0259040371 * l_ + 0.4072165126 * m_ - 0.4331205297 * s_
+        return mx.stack([L, a, b_], axis=-1)
+
+    target    = mx.array(strip_lin[rem])
+    target_ok = _oklab(target)
+    color     = _project(target)
+    mx.eval(target_ok, color)
+    baseline_color = color   # naive hull-clamp, before any gradient descent
+
+    L_target = target_ok[:, 0]
+    a_target = target_ok[:, 1]
+    b_target = target_ok[:, 2]
+    mx.eval(L_target, a_target, b_target)
+
+    def _run_phase(loss_fn, c, phase_label):
+        """Adam, projecting the candidate onto the hull after every step —
+        so the effective, gamut-clamped step is (projected_candidate - c)
+        rather than the raw Adam update. Adam's per-coordinate adaptivity is
+        needed here: phase 2 combines a primary term with a 1000x penalty
+        term, and that ill-conditioning stalls plain gradient descent.
+
+        Gradients are norm-clipped before feeding Adam's moment estimates.
+        Near black, Oklab's cube root has a very steep (though finite) slope,
+        so a pixel whose trajectory passes close to (0,0,0) can produce one
+        enormous gradient. Left unclipped, that single step dominates the
+        exponential moving averages — especially the slowly-decaying second
+        moment (beta2=0.999) — for dozens of subsequent steps, during which
+        Adam keeps moving in the wrong direction."""
+        lag       = mx.value_and_grad(loss_fn)
+        b1, b2, eps_a = 0.9, 0.999, 1e-8
+        max_grad_norm = 20.0
+        m_a       = mx.zeros(c.shape)
+        v_a       = mx.zeros(c.shape)
+        prev      = float('inf')
+        for step in range(1, max_iters + 1):
+            val, grad = lag(c)
+            grad_norm = mx.sqrt((grad * grad).sum(axis=-1, keepdims=True) + 1e-12)
+            grad = grad * mx.minimum(1.0, max_grad_norm / grad_norm)
+            m_a = b1 * m_a + (1.0 - b1) * grad
+            v_a = b2 * v_a + (1.0 - b2) * grad * grad
+            update = (m_a / (1.0 - b1 ** step)) / (mx.sqrt(v_a / (1.0 - b2 ** step)) + eps_a)
+            c      = _project(c - lr * update)
+            mx.eval(c, m_a, v_a, val)
+            curr = float(val)
+            if progress_label is not None and (step % 10 == 0 or step == max_iters):
+                print(f"\r  [mix] {progress_label} {phase_label} step {step:4d}/{max_iters} "
+                      f"loss={curr:.6f}   ", end="", file=sys.stderr, flush=True)
+            if abs(curr - prev) < tol:
+                break
+            prev = curr
+        if progress_label is not None:
+            print(file=sys.stderr, flush=True)
+        return c
+
+    # Phase 1: match luminance
+    color = _run_phase(lambda c: ((_oklab(c)[:, 0] - L_target) ** 2).mean(), color, "L")
+
+    # Phase 2: match chrominance (a, b jointly — hue and chroma together), preserve luminance
+    def _loss_ab(c):
+        lab = _oklab(c)
+        return ((lab[:, 1] - a_target) ** 2 + (lab[:, 2] - b_target) ** 2).mean() \
+             + 1000.0 * ((lab[:, 0] - L_target) ** 2).mean()
+    color = _run_phase(_loss_ab, color, "ab")
+
+    # Safety net: the two-phase optimisation should only ever improve on the
+    # naive hull-clamp, but near black Oklab's cube root is steep enough that
+    # occasional pixels can diverge instead (see module docs / BACKGROUND.md).
+    # Never let optimisation leave a pixel worse off than simply clamping it.
+    optimised_dist = ((_oklab(color) - target_ok) ** 2).sum(axis=-1)
+    baseline_dist  = ((_oklab(baseline_color) - target_ok) ** 2).sum(axis=-1)
+    color = mx.where((optimised_dist > baseline_dist)[:, None], baseline_color, color)
+    mx.eval(color)
+
+    out[rem] = np.array(color)
+    return out
+
+
+def mix_convert_additive(image, strip_h=256, max_iters=300, lr=0.02):
+    """Additive (linear-light) palette mixing: convex hull in linear RGB.
+
+    Pixels are clamped onto the palette's convex hull in linear RGB, then
+    walked back toward their original colour in Oklab space via projected
+    gradient descent (see _mix_strip_additive). Pixels already inside the
+    hull are left unchanged.
+    """
+    try:
+        import mlx.core  # noqa: F401
+    except ImportError:
+        print("Error: --mix additive requires MLX (pip install mlx)", file=sys.stderr)
+        sys.exit(1)
+
+    pal_bgr = np.array(PALETTE_BGR, dtype=np.float32) / 255.0  # (P, 3) sRGB
+    pal_lin = np.stack([
+        _srgb_to_linear(pal_bgr[:, 2]),
+        _srgb_to_linear(pal_bgr[:, 1]),
+        _srgb_to_linear(pal_bgr[:, 0]),
+    ], axis=-1).astype(np.float32)                              # (P, 3) linear RGB
+
+    black = np.zeros((1, 3), dtype=np.float32)
+    white = np.ones((1, 3),  dtype=np.float32)
+    pal_ext  = np.vstack([pal_lin, black, white])
+    hull_eqs = _halfspace_eqs(pal_ext)                          # (F, 4) — computed once
+
+    img_f   = image.astype(np.float32) / 255.0
+    rows, cols = img_f.shape[:2]
+    img_lin = np.stack([
+        _srgb_to_linear(img_f[:, :, 2]),
+        _srgb_to_linear(img_f[:, :, 1]),
+        _srgb_to_linear(img_f[:, :, 0]),
+    ], axis=-1).astype(np.float32)                               # (H, W, 3) R,G,B
+
+    print("  [mix] model=additive device=mlx", file=sys.stderr)
+    out_lin  = img_lin.copy()
+    n_strips = (rows + strip_h - 1) // strip_h
+    for si, r0 in enumerate(range(0, rows, strip_h)):
+        r1    = min(r0 + strip_h, rows)
+        strip = img_lin[r0:r1].reshape(-1, 3)
+        out   = _mix_strip_additive(strip, hull_eqs, max_iters=max_iters, lr=lr,
+                                    progress_label=f"strip {si + 1}/{n_strips}")
+        out_lin[r0:r1] = out.reshape(r1 - r0, cols, 3)
+
+    bgr = np.stack([
+        np.clip(_linear_to_srgb(out_lin[:, :, 2]), 0.0, 1.0),  # B
+        np.clip(_linear_to_srgb(out_lin[:, :, 1]), 0.0, 1.0),  # G
+        np.clip(_linear_to_srgb(out_lin[:, :, 0]), 0.0, 1.0),  # R
+    ], axis=-1)
+    return np.clip(bgr * 255.0, 0, 255).astype(np.uint8)
+
+
 def _nighttime(image):
     """Darken and cool: L→1-√(1-L), b shifted toward blue inversely proportional to L."""
     lab = _bgr_to_oklab(image.astype(np.float32) / 255.0)
@@ -737,10 +951,13 @@ def main():
     parser.add_argument("-o", "--output", required=True, help="Output image path")
     parser.add_argument("--dither", choices=["fs"],
                         help="Dithering: 'fs' (Floyd-Steinberg with blue noise)")
-    parser.add_argument("--mix", action="store_true",
-                        help="Spectral palette mixing: optimise simplex weights over "
-                             "Gaussian-reflectance Kubelka-Munk palette spectra (requires MLX). "
-                             "Ignores --dither.")
+    parser.add_argument("--mix", nargs="?", const="spectral", choices=["spectral", "additive"],
+                        help="Palette mixing (requires MLX; ignores --dither). "
+                             "'spectral' (default): optimise simplex weights over "
+                             "Gaussian-reflectance Kubelka-Munk palette spectra. "
+                             "'additive': clamp to the palette's convex hull in linear RGB, "
+                             "then nudge back toward the original colour in Oklab space via "
+                             "gamut-projected gradient descent.")
     parser.add_argument("--night", action="store_true",
                         help="Nighttime preprocessing: darken (L→L²) and cool (b shifted toward blue)")
     args = parser.parse_args()
@@ -753,8 +970,10 @@ def main():
     if args.night:
         image = _nighttime(image)
 
-    if args.mix:
+    if args.mix == "spectral":
         result = mix_convert_spectral(image)
+    elif args.mix == "additive":
+        result = mix_convert_additive(image)
     else:
         palette = build_lookup()
         result = convert(image, palette, dither=args.dither)

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Crop and apply depth-guided variable blur for wallpaper preparation.
+"""Crop and apply depth-guided defocus blur for wallpaper preparation.
 
-Estimates monocular depth, smooths and normalises the map, then blurs each
-pixel according to its depth value: foreground (high disparity) receives the
-most blur, background the least.  Blur is applied in linear light via a
-Gaussian pyramid with GPU acceleration through MLX when available.
+Implements the telecentric (infinite focal length) defocus model via layered
+forward-scatter compositing.  The depth map is divided into K slabs; each slab
+forward-scatters its content with a disc (pillbox) kernel of radius
+r = sigma_max · |d − d_focus| / denom (the telecentric CoC formula), then slabs
+are composited front-to-back with premultiplied alpha.  This correctly places
+background bokeh circles at foreground edges without heuristic depth dilation.
+All computation runs in linear light with GPU acceleration through MLX.
 
 Requirements:
     pip install transformers torch pillow
@@ -17,7 +20,6 @@ import sys
 import cv2
 import numpy as np
 
-_N_BLUR_LEVELS = 50
 _DEFAULT_MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
 
 
@@ -49,29 +51,45 @@ def _crop_to_aspect(image, ratio_w, ratio_h, align='center'):
         return image[y0:y0 + new_h, :]
 
 
-def _gaussian_blur_mlx(img_lin, sigma):
-    """Separable Gaussian blur on GPU via MLX depthwise convolution.
+def _make_disc_kernel(radius):
+    """Anti-aliased uniform disc (pillbox) kernel, normalised to sum 1.
 
-    Pre-pads with NumPy reflect mode so boundary pixels are mirrored rather
-    than treated as black; the paired convolutions consume that padding exactly.
+    The edge gets a 1-pixel linear ramp (clip(radius − dist + 0.5, 0, 1))
+    rather than a hard cutoff so that adjacent pyramid levels blend smoothly
+    during trilinear interpolation.
     """
+    if radius < 0.5:
+        return np.ones((1, 1), dtype=np.float32)
+    r_int = round(radius)
+    y, x = np.ogrid[-r_int:r_int + 1, -r_int:r_int + 1]
+    dist = np.sqrt(x.astype(np.float32) ** 2 + y.astype(np.float32) ** 2)
+    kernel = np.clip(radius - dist + 0.5, 0.0, 1.0).astype(np.float32)
+    kernel /= kernel.sum()
+    return kernel
+
+
+def _disc_blur_mlx(img, radius):
+    """Disc blur for (H, W, C) array on GPU via MLX 2-D depthwise convolution."""
     import mlx.core as mx
-    radius = round(3 * sigma)
-    x = np.arange(-radius, radius + 1, dtype=np.float32)
-    k = np.exp(-0.5 * (x / sigma) ** 2)
-    k = (k / k.sum()).astype(np.float32)
-
-    padded = np.pad(img_lin, [(radius, radius), (radius, radius), (0, 0)], mode='reflect')
-    t = mx.array(padded[None])  # (1, H+2r, W+2r, 3)
-
-    kh = mx.array(np.tile(k[None, None, :, None], (3, 1, 1, 1)))
-    t = mx.conv2d(t, kh, groups=3)
-
-    kv = mx.array(np.tile(k[None, :, None, None], (3, 1, 1, 1)))
-    t = mx.conv2d(t, kv, groups=3)
-
+    kernel = _make_disc_kernel(radius)
+    if kernel.shape == (1, 1):
+        return img
+    C = img.shape[2]
+    pad = kernel.shape[0] // 2
+    padded = np.pad(img, [(pad, pad), (pad, pad), (0, 0)], mode='reflect')
+    t = mx.array(padded[None])                                      # (1, H+2p, W+2p, C)
+    w = mx.array(np.tile(kernel[None, :, :, None], (C, 1, 1, 1)))  # (C, kH, kW, 1)
+    t = mx.conv2d(t, w, groups=C)
     mx.eval(t)
-    return np.array(t[0])  # (H, W, 3)
+    return np.array(t[0])  # (H, W, C)
+
+
+def _disc_blur_cpu(img, radius):
+    """Disc blur for (H, W, C) array on CPU via cv2.filter2D."""
+    kernel = _make_disc_kernel(radius)
+    if kernel.shape == (1, 1):
+        return img
+    return cv2.filter2D(img, -1, kernel, borderType=cv2.BORDER_REFLECT_101)
 
 
 def _estimate_depth(image_bgr, model=_DEFAULT_MODEL):
@@ -116,94 +134,82 @@ def _estimate_depth(image_bgr, model=_DEFAULT_MODEL):
                       interpolation=cv2.INTER_LINEAR)
 
 
-def _dilate_depth(depth_norm, sigma_max, n_levels):
-    """Soft depth-map dilation with cosine spatial falloff.
+def _depth_blur(image, depth_raw, sigma_max, d_focus=0.0, n_levels=16):
+    """Telecentric defocus blur via forward-scatter layered compositing.
 
-    Linearly-spaced radii r_k = r_max * k/K with sinusoidal weights
-    w_k = sin(π k/K) produce a cosine-shaped spatial gradient near foreground
-    edges, smooth (zero derivative) at both the inner and outer boundaries.
-    r_max = 3 * sigma_max gives a halo that extends to 3× the max blur radius.
+    Divides the depth map into K slabs.  Each slab k forward-scatters its
+    content by blurring (image × mask_k) with disc radius r_k — spreading that
+    layer's colour outward by exactly r_k pixels, exactly as a real aperture
+    does.  Slabs are then composited front-to-back with premultiplied alpha so
+    that foreground occludes background and background bokeh circles appear at
+    foreground edges without heuristic depth dilation.
+
+    CoC formula (telecentric): r_k = sigma_max · |d_k − d_focus| / denom
+    where denom = max(d_focus, 1 − d_focus).
+
+    depth_raw : (H, W) float32 — raw disparity; higher = closer to camera
+    sigma_max : max disc radius in pixels (CoC at the farthest depth from focus)
+    d_focus   : normalised disparity of the in-focus plane
+    n_levels  : number of depth slabs (controls smoothness; default 16)
     """
-    r_max = 3.0 * sigma_max
-    K = n_levels
-
-    radius_weight: dict = {}
-    for k in range(K + 1):
-        r = int(round(r_max * k / K))
-        w = float(np.sin(np.pi * k / K))
-        radius_weight[r] = radius_weight.get(r, 0.0) + w
-
-    total_w = sum(radius_weight.values())
-    result = np.zeros_like(depth_norm)
-    for r, w in sorted(radius_weight.items()):
-        if w == 0.0:
-            continue
-        if r == 0:
-            dilation = depth_norm
-        else:
-            ks = 2 * r + 1
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
-            dilation = cv2.dilate(depth_norm, kernel).astype(np.float32)
-        result += (w / total_w) * dilation
-
-    return result
-
-
-def _depth_blur(image, depth_raw, sigma_max, n_levels=_N_BLUR_LEVELS, power=2.0):
-    """Apply depth-guided variable Gaussian blur in linear light.
-
-    depth_raw  : (H, W) float32 — raw depth (any scale); higher = more blur
-    sigma_max  : maximum Gaussian sigma (pixels)
-    n_levels   : blur pyramid depth (higher = smoother level transitions)
-    power      : exponent applied to normalised depth before level mapping;
-                 2.0 = quadratic (keeps middle ground relatively sharp)
-
-    Pipeline: normalise depth → variable-radius dilation → depth^power → pyramid level.
-    """
-    # Normalise to [0, 1], then dilate
     d_min, d_max = float(depth_raw.min()), float(depth_raw.max())
-    if d_max - d_min > 1e-6:
-        depth = (depth_raw - d_min) / (d_max - d_min)
-    else:
-        depth = np.zeros_like(depth_raw)
-
-    print(f"  [blur] dilating depth map …", file=sys.stderr, flush=True)
-    depth = _dilate_depth(depth, sigma_max, n_levels)
+    depth = ((depth_raw - d_min) / (d_max - d_min)
+             if d_max - d_min > 1e-6 else np.zeros_like(depth_raw))
 
     img_lin = _srgb_to_linear(image.astype(np.float32) / 255.0)
+    H, W    = image.shape[:2]
+
+    denom = max(d_focus, 1.0 - d_focus)  # ≥ 0.5
 
     try:
         import mlx.core  # noqa: F401
-        _blur = lambda s: _gaussian_blur_mlx(img_lin, s)
+        _blur = _disc_blur_mlx
         print("  [blur] device=mlx", file=sys.stderr, flush=True)
     except ImportError:
-        _blur = lambda s: cv2.GaussianBlur(
-            img_lin, (int(s * 6) | 1, int(s * 6) | 1), s,
-            borderType=cv2.BORDER_REFLECT_101,
-        )
+        _blur = _disc_blur_cpu
         print("  [blur] device=cpu (install mlx for GPU acceleration)",
               file=sys.stderr, flush=True)
 
-    N = n_levels
-    print(f"  [blur] building {N}-level pyramid, sigma_max={sigma_max:.1f}px …",
+    K       = n_levels
+    centers = np.linspace(0.0, 1.0, K)           # slab centres; partition of unity
+    spacing = 1.0 / (K - 1) if K > 1 else 1.0
+    radii   = sigma_max * np.abs(centers - d_focus) / denom
+
+    # Accumulation buffers (premultiplied alpha)
+    color_acc  = np.zeros((H, W, 3), dtype=np.float32)
+    weight_acc = np.zeros((H, W),    dtype=np.float32)
+
+    # Front-to-back order: foreground (highest disparity) first so it occludes
+    order = np.argsort(centers)[::-1]
+
+    print(f"  [blur] scatter-compositing {K} layers, r_max={sigma_max:.1f}px …",
           file=sys.stderr, flush=True)
-    levels     = [img_lin] + [_blur(sigma_max * (i + 1) / N) for i in range(N)]
-    levels_arr = np.stack(levels, axis=0)  # (N+1, H, W, 3)
+    for i in order:
+        r_k = float(radii[i])
+        # Tent basis: linear interpolation between neighbouring slab centres,
+        # giving exact partition of unity (sum_k mask_k = 1 everywhere).
+        mask = np.maximum(0.0, 1.0 - np.abs(depth - centers[i]) / spacing,
+                          dtype=np.float32)
 
-    # Map normalised depth [0, 1] → continuous pyramid level [0, N]
-    level    = np.clip(depth ** power * N, 0.0, float(N))            # (H, W)
-    level_lo = np.clip(np.floor(level).astype(np.int32), 0, N - 1)
-    alpha    = (level - level_lo)[..., None]                         # (H, W, 1)
+        # Stack premultiplied colour and mask as 4 channels, blur in one pass.
+        premult = np.empty((H, W, 4), dtype=np.float32)
+        premult[:, :, :3] = img_lin * mask[:, :, None]
+        premult[:, :,  3] = mask
+        blurred = _blur(premult, r_k)
 
-    h, w  = image.shape[:2]
-    ll    = np.broadcast_to(level_lo[..., None], (h, w, 3))
-    rows  = np.arange(h)[:, None, None]
-    cols  = np.arange(w)[None, :, None]
-    chans = np.arange(3)[None, None, :]
-    lo    = levels_arr[ll,     rows, cols, chans]
-    hi    = levels_arr[ll + 1, rows, cols, chans]
+        color_k  = blurred[:, :, :3]  # disc_blur(image × mask) — scattered colour
+        alpha_k  = blurred[:, :,  3]  # disc_blur(mask)          — scattered coverage
 
-    result_lin = (1.0 - alpha) * lo + alpha * hi
+        # Premultiplied front-to-back composite: each layer fills what the
+        # front layers left uncovered.
+        remaining   = 1.0 - weight_acc
+        color_acc  += remaining[:, :, None] * color_k
+        weight_acc += remaining * alpha_k
+        # Guard against float accumulation error pushing weight above 1
+        np.clip(weight_acc, 0.0, 1.0, out=weight_acc)
+
+    # Un-premultiply (weight_acc ≈ 1 everywhere after all K layers)
+    result_lin = color_acc / (weight_acc[:, :, None] + 1e-6)
     return np.clip(_linear_to_srgb(result_lin) * 255.0, 0, 255).astype(np.uint8)
 
 
@@ -227,18 +233,18 @@ def main():
     # Depth
     parser.add_argument("--model", default=_DEFAULT_MODEL, metavar="MODEL",
                         help="HuggingFace depth estimation model ID")
-    parser.add_argument("--invert-depth", action="store_true",
-                        help="Invert depth map so background is blurred instead of foreground")
     parser.add_argument("--depth-only", action="store_true",
-                        help="Save depth map as greyscale and exit (useful for tuning)")
+                        help="Save blur-strength map as greyscale and exit (useful for tuning)")
 
     # Blur
     parser.add_argument("--blur", type=float, default=2.0, metavar="PCT",
-                        help="Max blur sigma as %% of image height")
-    parser.add_argument("--levels", type=int, default=_N_BLUR_LEVELS, metavar="N",
-                        help="Blur pyramid levels")
-    parser.add_argument("--power", type=float, default=2.0, metavar="P",
-                        help="Depth-to-blur curve exponent: 1=linear, 2=quadratic (default)")
+                        help="Max disc radius as %% of image height (circle of confusion at "
+                             "the farthest point from the focus plane)")
+    parser.add_argument("--levels", type=int, default=16, metavar="N",
+                        help="Number of depth slabs for scatter compositing")
+    parser.add_argument("--focus", type=float, default=0.0, metavar="D",
+                        help="Focus plane as normalised disparity: 0.0=background/infinity "
+                             "(default), 1.0=foreground")
 
     args = parser.parse_args()
 
@@ -253,20 +259,19 @@ def main():
 
     depth_raw = _estimate_depth(image, model=args.model)
 
-    if args.invert_depth:
-        depth_raw = depth_raw.max() - depth_raw
-
     if args.depth_only:
         d_min, d_max = float(depth_raw.min()), float(depth_raw.max())
-        vis = (depth_raw - d_min) / (d_max - d_min) if d_max > d_min else np.zeros_like(depth_raw)
-        ok  = cv2.imwrite(args.output, (vis * 255).astype(np.uint8))
+        depth_norm = (depth_raw - d_min) / (d_max - d_min) if d_max > d_min else np.zeros_like(depth_raw)
+        denom = max(args.focus, 1.0 - args.focus)
+        vis   = np.abs(depth_norm - args.focus) / denom  # white = max blur, black = in focus
+        ok    = cv2.imwrite(args.output, np.clip(vis * 255, 0, 255).astype(np.uint8))
     else:
         h        = image.shape[0]
         sigma_px = max(1.0, args.blur / 100.0 * h)
         result   = _depth_blur(image, depth_raw,
                                sigma_max=sigma_px,
-                               n_levels=args.levels,
-                               power=args.power)
+                               d_focus=args.focus,
+                               n_levels=args.levels)
         ok = cv2.imwrite(args.output, result)
 
     if not ok:
