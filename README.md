@@ -59,6 +59,21 @@ python3 nordify.py <input> -o <output> [options]
 | `--mix [spectral\|additive]` | Palette mixing (requires MLX); see [Methods](#palette-mixing---mix) below. |
 | `--night` | Nighttime pre-processing: darken and cool the image before palette conversion |
 
+### Utility — `entropy_crop.py`
+
+An alternative to `depth_blur.py`'s `--align left`/`center`/`right`: picks a crop offset by minimising the entropy of the edges the crop boundary would cut, then applies that same offset to one or more images — useful for re-cropping an already-finished wallpaper to a second aspect ratio (e.g. deriving a 3:2 variant from a 16:9 one) while keeping a day/night pair aligned. See [Methods](#entropy-minimising-crop-entropy_croppy) below.
+
+```
+python3 entropy_crop.py <edge-source> --aspect W:H <in1> <out1> [<in2> <out2> ...]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--aspect W:H` | `16:9` | Target aspect ratio |
+| `--visualize PATH` | — | Save a copy of `edge-source` with the chosen crop boundaries drawn on it |
+
+`edge-source` is only used to choose the crop offset (via its own edges) — it is not implicitly cropped; include it in the `<in> <out>` pairs if it should be too. Every input must be pixel-aligned with `edge-source` (i.e. the same dimensions).
+
 ### Examples
 
 ```bash
@@ -84,6 +99,12 @@ python3 nordify.py blurred.png -o wallpaper.png --mix
 # 3:2 wallpaper, keeping left side, heavier blur
 python3 depth_blur.py photo.jpg -o blurred.png --aspect 3:2 --align left --blur 4
 python3 nordify.py blurred.png -o wallpaper.png --mix
+
+# Derive a 3:2 crop from an already-finished 16:9 wallpaper (and its night
+# variant) via minimum-entropy cropping, keeping both pixel-aligned
+python3 entropy_crop.py wallpaper.png --aspect 3:2 \
+    wallpaper.png wallpaper_3x2.png \
+    wallpaper_night.png wallpaper_night_3x2.png
 ```
 
 ## Samples
@@ -137,6 +158,12 @@ For a more detailed discussion of the algorithms and their artistic rationale, s
 ### Depth-guided blur (`depth_blur.py`)
 
 Estimates monocular depth via [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) and applies a telecentric defocus (bokeh) model via layered forward-scatter compositing. The depth map is divided into `--levels` slabs with tent-function membership (an exact partition of unity); each slab forward-scatters its own colour and coverage outward by a disc (pillbox) kernel sized to that slab's circle of confusion — `r = sigma_max · |d − d_focus| / denom` — exactly as a real aperture spreads light from an out-of-focus point. Slabs are then composited front-to-back with premultiplied alpha, so nearer slabs occlude farther ones. Because blur is scattered from each source pixel outward rather than gathered into each output pixel from a neighbourhood sized by its own depth, background bokeh naturally bleeds up to (and is naturally clipped by) sharp foreground edges, and a blurred foreground naturally bleeds semi-transparently over a sharp background — with no heuristic depth dilation needed. Blur runs in linear light with MLX GPU acceleration on Apple Silicon when available.
+
+### Entropy-minimising crop (`entropy_crop.py`)
+
+Picks a crop offset without any notion of saliency or subject detection — only of *disruption*. For each candidate offset along the axis that needs narrowing, the crop's two boundary lines are laid over a Sobel gradient-magnitude map of the source image (continuous, not thresholded — a binary edge detector like Canny goes nearly empty on an already palette-snapped image, which is mostly large flat colour regions, and ties pathologically). Summing that gradient magnitude along both boundary lines gives an unnormalised distribution over rows (or columns, for a height crop): how much of an edge each row's slice of the boundary cuts through. The Shannon entropy of that distribution is the score for the offset — low when the cuts are concentrated in a few rows (the boundary mostly threads through flat sky, water, or background, only clipping something in a narrow band) and high when they're smeared evenly across many rows, i.e. slicing through many different objects all over the frame. An offset that cuts no edges at all scores zero entropy, the best case. The offset with the lowest entropy wins (ties broken by lowest total edge weight cut).
+
+This has no idea what a moon or a smokestack *is* — it just avoids drawing the crop line through wherever the image is busiest, which is often, but not always, the same thing an eye would pick.
 
 ### Nighttime pre-processing (`--night`)
 
