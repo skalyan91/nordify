@@ -235,6 +235,9 @@ def main():
                         help="HuggingFace depth estimation model ID")
     parser.add_argument("--depth-only", action="store_true",
                         help="Save blur-strength map as greyscale and exit (useful for tuning)")
+    parser.add_argument("--save-depth", metavar="PATH",
+                        help="Also save the normalised depth map (white=near, black=far) "
+                             "alongside the main output, e.g. for barycentre_crop.py")
 
     # Blur
     parser.add_argument("--blur", type=float, default=2.0, metavar="PCT",
@@ -258,6 +261,12 @@ def main():
         image = _crop_to_aspect(image, ratio_w, ratio_h, align=args.align)
 
     depth_raw = _estimate_depth(image, model=args.model)
+
+    if args.save_depth:
+        d_min, d_max = float(depth_raw.min()), float(depth_raw.max())
+        depth_norm = (depth_raw - d_min) / (d_max - d_min) if d_max > d_min else np.zeros_like(depth_raw)
+        cv2.imwrite(args.save_depth, np.clip(depth_norm * 255, 0, 255).astype(np.uint8))
+        print(f"Saved depth map '{args.save_depth}'")
 
     if args.depth_only:
         d_min, d_max = float(depth_raw.min()), float(depth_raw.max())

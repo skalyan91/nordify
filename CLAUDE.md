@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**nord-lab** is a Python CLI pipeline that prepares wallpapers in the [Nord colour palette](https://www.nordtheme.com/). `depth_blur.py` handles cropping and depth-guided blur; `nordify.py` handles palette conversion. `entropy_crop.py` is a standalone utility for choosing a crop offset algorithmically instead of via `--align`.
+**nord-lab** is a Python CLI pipeline that prepares wallpapers in the [Nord colour palette](https://www.nordtheme.com/). `depth_blur.py` handles cropping and depth-guided blur; `nordify.py` handles palette conversion. `barycentre_crop.py` is a standalone utility for choosing a crop offset algorithmically instead of via `--align`.
 
 ## Setup and Usage
 
@@ -17,8 +17,9 @@ python3 depth_blur.py <input> -o <blurred> [--aspect W:H] [--align ...] [--blur 
 # Step 2 — nordify
 python3 nordify.py <blurred> -o <output> [--dither fs] [--mix [spectral|additive]]
 
-# Optional — pick a crop offset by minimising cut-edge entropy, apply to N images at once
-python3 entropy_crop.py <edge-source> --aspect W:H <in1> <out1> [<in2> <out2> ...]
+# Optional — pick a crop offset by centreing the depth map's barycentre, apply to N images at once
+python3 depth_blur.py <input> -o <blurred> --no-crop --save-depth <depth.png>
+python3 barycentre_crop.py <depth.png> --aspect W:H <in1> <out1> [<in2> <out2> ...]
 ```
 
 Core dependencies: `numpy`, `opencv-python-headless` (in `venv/`).  
@@ -91,14 +92,12 @@ Preprocessing script: crop → depth estimation → depth-guided blur.
 
 **`_disc_blur_mlx(img, radius)`** / **`_disc_blur_cpu(img, radius)`** — disc blur for `(H, W, C)` arrays (any C) on GPU via MLX 2-D depthwise `conv2d` (weight shape `(C, kH, kW, 1)`, `groups=C`) or CPU via `cv2.filter2D`. Both reflect-pad at boundaries.
 
-**`_depth_blur(image, depth_raw, sigma_max, d_focus=0.0, n_levels=16)`** — **layered forward-scatter compositing**. Divides depth into K=`n_levels` slabs with tent-function membership (exact partition of unity). For each slab k (front-to-back order, foreground first): packs `image × mask_k` and `mask_k` as a 4-channel array, blurs with disc radius `rₖ = sigma_max · |dₖ − d_focus| / max(d_focus, 1−d_focus)` (telecentric CoC), then composites with premultiplied alpha (`color_acc += remaining · color_k`, `weight_acc += remaining · alpha_k`). Background bokeh circles at foreground edges emerge naturally from the forward scatter — no depth dilation needed. Un-premultiplies at the end (`result / weight_acc`). `--depth-only` saves the blur-strength map `|d − d_focus| / denom` (white = max blur, black = in-focus plane).
+**`_depth_blur(image, depth_raw, sigma_max, d_focus=0.0, n_levels=16)`** — **layered forward-scatter compositing**. Divides depth into K=`n_levels` slabs with tent-function membership (exact partition of unity). For each slab k (front-to-back order, foreground first): packs `image × mask_k` and `mask_k` as a 4-channel array, blurs with disc radius `rₖ = sigma_max · |dₖ − d_focus| / max(d_focus, 1−d_focus)` (telecentric CoC), then composites with premultiplied alpha (`color_acc += remaining · color_k`, `weight_acc += remaining · alpha_k`). Background bokeh circles at foreground edges emerge naturally from the forward scatter — no depth dilation needed. Un-premultiplies at the end (`result / weight_acc`). `--depth-only` saves the blur-strength map `|d − d_focus| / denom` (white = max blur, black = in-focus plane); `--save-depth` saves the plain normalised depth map (no focus-relative transform) alongside the main blurred output, for `barycentre_crop.py`.
 
-## entropy_crop.py
+## barycentre_crop.py
 
-Standalone utility: picks a crop offset by minimising the entropy of the edges it would cut, then applies that offset to one or more pixel-aligned images. No saliency/subject model — it only avoids cutting through wherever the image is locally busiest.
+Standalone utility: picks a crop offset that centres the depth map's barycentre, then applies that offset to one or more pixel-aligned images. No edge/saliency model — reuses the depth map `depth_blur.py` already computes.
 
-**`_gradient_magnitude(image_bgr)`** — Sobel gradient magnitude (`sqrt(gx² + gy²)`) on a lightly Gaussian-blurred (`σ=1.5`) grayscale image. Continuous, not thresholded: a binary detector like Canny goes nearly empty on an already palette-snapped image (mostly large flat colour regions), which ties candidate offsets pathologically.
+**`find_crop_offset(depth_map, ratio_w, ratio_h)`** — crops whichever axis the target ratio requires narrowing (same width-vs-height test as `depth_blur.py`'s `_crop_to_aspect`). Sums the depth map's pixel values (mass) along the other axis into a marginal per-row/column profile, takes its weighted mean coordinate as the barycentre, then centres the crop window on it: `offset = round(barycentre − new_length/2)`, clamped to `[0, excess]`. A depth map with ~zero total mass (degenerate/flat) falls back to a plain centred crop.
 
-**`find_crop_offset(image_bgr, ratio_w, ratio_h)`** — crops whichever axis the target ratio requires narrowing (same width-vs-height test as `depth_blur.py`'s `_crop_to_aspect`). For every candidate offset, sums the gradient magnitude along the two boundary lines (rows for a width crop, columns for a height crop) into a per-row/column profile, normalises it to a probability distribution, and scores it by Shannon entropy — `0` bits if the offset cuts no edges at all (the ideal case), low when cut weight is concentrated in a few rows/columns, high when smeared evenly across many (i.e. slicing through many different objects). Returns the offset with lowest entropy, ties broken by lowest total edge weight cut (`np.lexsort`).
-
-**`main()`** — reads one edge-detection source image, computes the offset once via `find_crop_offset`, then applies `_apply_crop` identically to every `<in> <out>` pair given (asserting each input is pixel-aligned with the edge source) — so a day/night pair of the same wallpaper crops in lock-step. `--visualize` optionally dumps the edge source with the chosen boundary lines drawn on it, for sanity-checking.
+**`main()`** — reads one depth-map image, computes the offset once via `find_crop_offset`, then applies `_apply_crop` identically to every `<in> <out>` pair given (asserting each input is pixel-aligned with the depth map) — so a day/night pair of the same wallpaper crops in lock-step. `--visualize` optionally dumps the depth map with the barycentre and chosen boundary lines drawn on it, for sanity-checking.
