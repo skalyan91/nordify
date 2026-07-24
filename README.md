@@ -13,7 +13,7 @@ pip install -r requirements.txt
 For depth estimation and palette mixing, also install:
 
 ```bash
-pip install transformers torch pillow  # depth_blur.py
+pip install transformers torch torchvision pillow  # depth_blur.py
 pip install mlx                        # --mix (Apple Silicon required)
 ```
 
@@ -44,6 +44,8 @@ python3 depth_blur.py <input> -o <blurred> [options]
 | `--focus D` | `0.0` | Focus plane as normalised disparity: `0.0`=background/infinity, `1.0`=foreground |
 | `--depth-only` | — | Save the blur-strength map and exit (useful for tuning) |
 | `--save-depth PATH` | — | Also save the normalised depth map alongside the main output, e.g. for `barycentre_crop.py` |
+| `--fix-sky` | — | Correct sky/foreground depth inversions (seen on stylised art) using an Otsu-segmented Depth Anything V2 sky mask; see [Methods](#sky-depth-correction---fix-sky) below |
+| `--flatten-masts` | — | Flatten thin, tall, solid vertical structures (chimneys, masts) to their own median depth; see [Methods](#mast-depth-flattening---flatten-masts) below |
 | `--model MODEL` | Depth Anything V2 Small | HuggingFace depth model ID |
 
 ### Step 2 — `nordify.py`
@@ -128,7 +130,7 @@ Original photo by [Philippe Gauthier](https://unsplash.com/photos/orange-fruits-
 |---|---|
 | ![Mixed spectral](samples/mixed.png) | ![Mixed additive](samples/mixed_additive.png) |
 
-**Wallpaper crop + depth-guided defocus blur + spectral palette mixing (`depth_blur.py` → `nordify.py --mix`):**
+**Wallpaper crop + depth-guided defocus blur + additive palette mixing (`depth_blur.py` → `nordify.py --mix additive`):**
 
 ![Wallpaper](samples/wallpaper.png)
 
@@ -161,7 +163,25 @@ For a more detailed discussion of the algorithms and their artistic rationale, s
 
 ### Depth-guided blur (`depth_blur.py`)
 
-Estimates monocular depth via [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) and applies a telecentric defocus (bokeh) model via layered forward-scatter compositing. The depth map is divided into `--levels` slabs with tent-function membership (an exact partition of unity); each slab forward-scatters its own colour and coverage outward by a disc (pillbox) kernel sized to that slab's circle of confusion — `r = sigma_max · |d − d_focus| / denom` — exactly as a real aperture spreads light from an out-of-focus point. Slabs are then composited front-to-back with premultiplied alpha, so nearer slabs occlude farther ones. Because blur is scattered from each source pixel outward rather than gathered into each output pixel from a neighbourhood sized by its own depth, background bokeh naturally bleeds up to (and is naturally clipped by) sharp foreground edges, and a blurred foreground naturally bleeds semi-transparently over a sharp background — with no heuristic depth dilation needed. Blur runs in linear light with MLX GPU acceleration on Apple Silicon when available.
+Estimates monocular depth via [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2) Small. Depth Anything is a fixed-input-size model — its image processor resizes everything down to a small fixed size (e.g. 518px) regardless of source resolution — so a single whole-image pass alone would destroy thin foreground structures (wires, masts, lattice towers) before the network ever sees them. Instead, several overlapping-tile refinement passes run at different footprint sizes (fractions of the image's width — default `[0.5, 0.25, 0.125]`), each tile least-squares aligned (scale + shift; monocular depth models are only defined up to an unknown per-inference affine transform) directly against the initial whole-image pass and blended internally with tent-feathered edges, and the final depth map is the **per-pixel maximum** across the whole-image pass and all the tile passes. Different footprints have different blind spots — a wide pass gives smooth, consistent depth on solid objects but loses thin wires and blends soft things (steam, smoke) into the sky; a narrow, near-native-resolution pass keeps fine detail (down to a lattice tower's individual crossing struts) but is noisier on large solid objects — and taking the max lets each pass contribute only where it's more confident something is close, so one pass's blind spot can't erase another's correctly-recovered detail. (Apple's Depth Pro is still available via `--model apple/DepthPro-hf`, and skips this tiling entirely — it derives patches from multiple downsamplings of the *original* image internally, so a single pass already sees fine detail with no tiling needed — but it isn't the default: on stylised/painted art it can misjudge large flat regions in a way Depth Anything doesn't, see `--fix-sky` below.) Then applies a telecentric defocus (bokeh) model via layered forward-scatter compositing. The depth map is divided into `--levels` slabs with tent-function membership (an exact partition of unity); each slab forward-scatters its own colour and coverage outward by a disc (pillbox) kernel sized to that slab's circle of confusion — `r = sigma_max · |d − d_focus| / denom` — exactly as a real aperture spreads light from an out-of-focus point. Slabs are then composited front-to-back with premultiplied alpha, so nearer slabs occlude farther ones. Because blur is scattered from each source pixel outward rather than gathered into each output pixel from a neighbourhood sized by its own depth, background bokeh naturally bleeds up to (and is naturally clipped by) sharp foreground edges, and a blurred foreground naturally bleeds semi-transparently over a sharp background — with no heuristic depth dilation needed. Blur runs in linear light with MLX GPU acceleration on Apple Silicon when available.
+
+### Sky depth correction (`--fix-sky`)
+
+No longer needed by the default pipeline — Depth Anything V2 (the default model) doesn't make the mistake this corrects. Still available via `--fix-sky` for anyone using `--model apple/DepthPro-hf`.
+
+Depth Pro, trained on real photographs, can read a flat, desaturated, silhouette-like region as *near* — a strong learned cue for atmospheric haze in photos — even when it's the sky sitting behind a much nearer, plainly-painted structure. Confirmed on a power-station painting, where Depth Pro placed the sky nearer than the building in front of it while Depth Anything V2 got the same region right — an out-of-distribution failure specific to stylised/painted content, not a general flaw. `--fix-sky` corrects it: Depth Anything V2's map is Otsu-thresholded to locate the sky (its single farthest, most tightly-clustered region), then that region's Depth Anything values — least-squares fit to Depth Pro's scale using everything *outside* the sky mask, never the sky itself — are blended into the result through a feathered mask, with a safety clamp guaranteeing the corrected sky never reads nearer than the nearest non-sky pixel. This roughly doubles depth-estimation time (Depth Anything's tiled pass runs alongside Depth Pro's) but that's still small next to `nordify.py --mix`'s per-image runtime.
+
+### Mast depth flattening (`--flatten-masts`)
+
+Superseded by the default pipeline's multi-pass max combination above — the wide (`0.5`) tiling pass already gives smokestacks smooth, consistent depth directly. Still available via `--flatten-masts`.
+
+A thin, tall, rigid vertical structure (a smokestack) can come out of either depth model with substantial internal noise along its height, even though its true depth barely varies top to bottom. `--flatten-masts` finds candidates via [Segment Anything](https://github.com/facebookresearch/segment-anything)'s automatic mask generation on the source image rather than the depth map (using the depth map to find its own errors is circular, and both models place smokestacks near the low/"far" end of their own range, so an Otsu split just lumps them in with sky). Masks are kept only if their own bounding box is tall/narrow — SAM's masks already respect real object boundaries, so the transmission tower's wire lattice (equally thin and tall, but sparse, and which legitimately does vary in depth as it recedes toward a vanishing point) isn't returned as a tall/narrow mask in the first place, unlike an earlier classical contrast-based approach that needed a separate solidity check and still missed a mast embedded in busy painted clouds.
+
+Each surviving mast isn't flattened to a single value outright — that would erase genuine perspective drift on a mast large enough to show any. Instead, each pixel's deviation from the mast's own median depth is clamped to a tolerance band: deviations already inside it pass through untouched, and only the excess — the part with no plausible perspective explanation — gets pulled in. That tolerance shrinks quadratically (not linearly) toward the background, since disparity is proportional to inverse distance: a mast twice as far away can plausibly show only a quarter of the depth spread, not half. In practice this gives the scene's nearest object a full ±15% tolerance, dropping to roughly ±2% for a background-level smokestack.
+
+The clamp only ever pulls a pixel toward its mast's median from the *far* side, never the near side — a mast can't have something genuinely farther "through" it, but a pixel reading nearer could be something real crossing in front (a transmission wire passing over a smokestack was losing its correct depth this way until the clamp was made one-sided).
+
+The image is downsampled (1500px wide by default) before running SAM: its encoder resizes to a fixed internal resolution regardless of input size, so the full-resolution source produces identical mask quality at ~60x the cost (~17 minutes vs. ~17 seconds for one 4500px-wide image).
 
 ### Barycentre-centred crop (`barycentre_crop.py`)
 

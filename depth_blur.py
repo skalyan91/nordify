@@ -21,6 +21,7 @@ import cv2
 import numpy as np
 
 _DEFAULT_MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
+_DEFAULT_TILE_WIDTH_FRACS = [0.5, 0.25, 0.125]
 
 
 def _srgb_to_linear(c):
@@ -92,14 +93,175 @@ def _disc_blur_cpu(img, radius):
     return cv2.filter2D(img, -1, kernel, borderType=cv2.BORDER_REFLECT_101)
 
 
-def _estimate_depth(image_bgr, model=_DEFAULT_MODEL):
-    """Run depth estimation on a BGR uint8 image.
+def _tile_starts(length, tile, stride):
+    """1-D tile start offsets covering [0, length) with the given tile size
+    and stride, snapping the last tile flush with the far edge."""
+    if length <= tile:
+        return [0]
+    starts = list(range(0, length - tile + 1, stride))
+    if starts[-1] != length - tile:
+        starts.append(length - tile)
+    return starts
 
-    Returns (H, W) float32.  Output follows the disparity convention used by
-    Depth Anything / MiDaS: higher values = closer to the camera (foreground).
-    Values are NOT yet normalised — normalisation is deferred to after smoothing.
 
-    Requires: pip install transformers torch pillow
+def _feather_weights(start, length, total, overlap):
+    """1-D tent-feathered blend weight for a tile spanning [start, start+length)
+    within an axis of size total.
+
+    Ramps 0→1 over the tile's leading `overlap` pixels and 1→0 over its
+    trailing `overlap` pixels — but only on sides that have a neighbouring
+    tile to hand off to; a tile flush with the image border holds full
+    weight right up to that border, since nothing blends in from outside it.
+    """
+    w = np.ones(length, dtype=np.float32)
+    if overlap <= 0:
+        return w
+    idx   = np.arange(length)
+    left  = idx if start > 0 else np.full(length, overlap, dtype=np.int64)
+    right = (length - 1 - idx) if start + length < total else np.full(length, overlap, dtype=np.int64)
+    return np.clip(np.minimum(left, right) / overlap, 0.0, 1.0).astype(np.float32)
+
+
+def _tile_refine(rgb, infer_fn, reference, native_tile, footprint, overlap_frac):
+    """One pass of tiled depth refinement against `reference`: crops
+    overlapping tiles sized to `footprint` (downsampled to `native_tile` for
+    inference if larger), each least-squares aligned — scale + shift — to
+    `reference`'s own values in its footprint, then blended together with
+    tent-feathered edges. `reference` need not be a single global pass; a
+    multi-pass cascade can chain calls, each refining the previous call's
+    output at a narrower (higher-resolution, lower-context) footprint.
+    Returns a depth map the same (H, W) shape as `reference`.
+    """
+    H, W = reference.shape
+    if W <= footprint and H <= footprint:
+        return reference   # whole image already fits in one tile's footprint
+
+    overlap = round(footprint * overlap_frac)
+    stride  = footprint - overlap
+    xs = _tile_starts(W, footprint, stride)
+    ys = _tile_starts(H, footprint, stride)
+
+    print(f"  [depth] tiled refinement: {len(xs)}x{len(ys)} tiles, "
+          f"footprint={footprint}px, native={native_tile}px, overlap={overlap_frac}...",
+          file=sys.stderr, flush=True)
+
+    depth_acc  = np.zeros((H, W), dtype=np.float32)
+    weight_acc = np.zeros((H, W), dtype=np.float32)
+
+    n_tiles = len(xs) * len(ys)
+    for yi, y0 in enumerate(ys):
+        wy = _feather_weights(y0, footprint, H, overlap)
+        for xi, x0 in enumerate(xs):
+            crop = rgb[y0:y0 + footprint, x0:x0 + footprint]
+            # Downsample the (possibly larger-than-native) footprint crop to
+            # the model's own input resolution for inference, then upsample
+            # the result back to the crop's own footprint size.
+            crop_native = (cv2.resize(crop, (native_tile, native_tile), interpolation=cv2.INTER_AREA)
+                          if footprint != native_tile else crop)
+            tile_depth = cv2.resize(infer_fn(crop_native), (footprint, footprint),
+                                    interpolation=cv2.INTER_LINEAR)
+
+            # Least-squares affine fit to the reference map's values in this
+            # tile's footprint (subsampled for speed) — aligns this tile's
+            # arbitrary scale/shift to the reference's scale without erasing
+            # the fine detail the tile alone can see.
+            target = reference[y0:y0 + footprint, x0:x0 + footprint]
+            src = tile_depth[::4, ::4].ravel().astype(np.float64)
+            dst = target[::4, ::4].ravel().astype(np.float64)
+            (a, b), *_ = np.linalg.lstsq(
+                np.stack([src, np.ones_like(src)], axis=1), dst, rcond=None)
+            aligned = (a * tile_depth + b).astype(np.float32)
+
+            wx     = _feather_weights(x0, footprint, W, overlap)
+            weight = wy[:, None] * wx[None, :]
+
+            depth_acc[y0:y0 + footprint, x0:x0 + footprint]  += weight * aligned
+            weight_acc[y0:y0 + footprint, x0:x0 + footprint] += weight
+
+            print(f"\r  [depth]   tile {yi * len(xs) + xi + 1}/{n_tiles}",
+                  end="", file=sys.stderr, flush=True)
+    print(file=sys.stderr, flush=True)
+
+    return depth_acc / np.maximum(weight_acc, 1e-6)
+
+
+def _estimate_depth(image_bgr, model=_DEFAULT_MODEL,
+                    tile_width_frac=_DEFAULT_TILE_WIDTH_FRACS, tile_overlap=0.5):
+    """High-resolution monocular depth.
+
+    Depth Anything V2 (the default) is a fixed-input-size model — its image
+    processor resizes everything down to a small fixed size (e.g. 518px)
+    regardless of source resolution — so a single whole-image ("global")
+    inference alone destroys thin foreground structures (wires, masts,
+    lattice towers) before the network ever sees them, and silently inherits
+    whatever's behind them in the depth map. `_tile_refine` recovers that
+    detail: it re-runs the same model on overlapping tiles cropped at
+    (approximately) its own native input resolution, so each tile needs
+    little or no further downsampling and thin structures survive as real
+    edges. Because the model's depth output is only defined up to an
+    unknown per-inference affine transform (it's trained with a
+    scale/shift-invariant loss), each tile's result isn't on the same scale
+    as its neighbours or the global map — tiles are least-squares fit
+    (scale + shift) to a reference map before blending them together with
+    tent-feathered edges. See `tile_width_frac` below for how multiple such
+    passes at different footprints are combined.
+
+    Apple's Depth Pro (`--model apple/DepthPro-hf`) doesn't have this
+    limitation: it derives its patches from multiple downsamplings of the
+    *original* image and fuses them internally, so a single whole-image
+    inference already sees thin foreground structures at native resolution
+    — confirmed empirically: it recovers a several-px-wide transmission
+    tower from a single pass on a 5000px-wide source with no tiling at all
+    (`skip_tiling` below detects it specifically and returns its global pass
+    directly, since tiling measurably doesn't help it). It was the default
+    here until it was found to occasionally misjudge large flat regions on
+    stylised/painted art in a way Depth Anything V2 doesn't (see
+    `--fix-sky`) — and with the multi-pass tiling below, Depth Anything now
+    matches or exceeds it on thin-structure detail too, so it's no longer
+    needed as the default for that either.
+
+    `tile_width_frac` and `tile_overlap` are exposed for experimenting with
+    a context-vs-resolution tradeoff: a tile cropped at the model's own
+    native resolution ("100% zoom", `tile_width_frac=None`) sees maximum
+    per-tile resolution but minimum surrounding context, which may be
+    exactly what starves the model of the cues it needs to recognise "one
+    rigid object" rather than reading a noisy mix of nearby scales. Setting
+    `tile_width_frac` to e.g. `0.5` sizes each tile's *source crop* to that
+    fraction of the image's width (so `0.5` = each tile's footprint spans
+    half the original image) — larger than the model's native input size —
+    and downsamples just that crop down to native resolution before
+    inference, giving the model a wider field of view per tile at reduced
+    (but still better-than-a-single-global-pass) resolution. This is a
+    different, larger-footprint tile than the "100% zoom" case, not a
+    resize of the whole image before a fixed-size tiling pass.
+
+    `tile_width_frac` also accepts a list: each fraction gets its own
+    independent tiled pass — every one aligned directly against the global
+    map, not chained through each other — and the final result is the
+    per-pixel *maximum* disparity (nearest reading) across the global map and
+    every pass. Different footprints have different blind spots that don't
+    overlap much, so this recovers each one's strengths rather than forcing
+    a single tradeoff: a wide pass (e.g. `0.5`) gives smooth, internally
+    consistent depth on solid objects (no more per-pixel mast noise) but
+    blends soft, semi-transparent things (steam, smoke) into the sky behind
+    them, and loses thin wires outright past roughly a 2.5x per-tile
+    downsample; a narrow pass (e.g. `0.125`, close to native resolution)
+    keeps fine detail — even a lattice tower's individual crossing struts —
+    but is noisy on large solid objects the way a lone native-zoom tiling
+    pass always was. Since max only ever pulls a value *nearer*, never
+    farther, each pass can only contribute where it's more confident
+    something is close, not accidentally erase another pass's correct
+    detail — confirmed empirically across `[0.5, 0.25, 0.125]`: smooth masts
+    (from the 0.5 pass), a fully-resolved lattice tower (from the 0.125
+    pass), and steam clearly separated from sky (recovered by whichever pass
+    read it nearest), all in one map, each in a few seconds.
+
+    Returns (H, W) float32, disparity convention (higher = closer). Depth
+    Pro outputs metric depth in metres (higher = *farther*); this is
+    inverted to disparity so the rest of the pipeline (CoC formula,
+    --focus, rowmax) can treat every model's output the same way.
+
+    Requires: pip install transformers torch pillow torchvision
     """
     try:
         from transformers import pipeline as hf_pipeline
@@ -108,30 +270,77 @@ def _estimate_depth(image_bgr, model=_DEFAULT_MODEL):
     except ImportError as e:
         print(
             f"Error: {e}\n"
-            "Depth estimation requires: pip install transformers torch pillow",
+            "Depth estimation requires: pip install transformers torch pillow torchvision",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    rgb     = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    pil_img = PILImage.fromarray(rgb)
+    rgb  = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    H, W = image_bgr.shape[:2]
 
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = "mps"
     else:
         device = "cpu"
     print(f"  [depth] model={model}  device={device}", file=sys.stderr, flush=True)
-
     pipe = hf_pipeline("depth-estimation", model=model, device=device)
-    out  = pipe(pil_img)
+    is_metric = "DepthPro" in type(pipe.model).__name__
+    # Depth Pro derives its patches from multiple downsamplings of the
+    # *original* image and fuses them internally, rather than resizing the
+    # whole image down to its image processor's nominal size and stopping
+    # there (as fixed-input-size models like Depth Anything do) — confirmed
+    # empirically: a single pass recovers a several-px-wide transmission
+    # tower from a 5000px-wide source. So a global pass alone is sufficient
+    # regardless of how that source resolution compares to the processor's
+    # advertised `size`, unlike every other model this function has been
+    # run against.
+    skip_tiling = is_metric
 
-    raw = np.array(out["predicted_depth"], dtype=np.float32)
-    if raw.ndim > 2:
-        raw = raw.squeeze()
+    def _infer(rgb_arr):
+        out = pipe(PILImage.fromarray(rgb_arr))
+        raw = np.array(out["predicted_depth"], dtype=np.float32)
+        if raw.ndim > 2:
+            raw = raw.squeeze()
+        if is_metric:
+            raw = 1.0 / (raw + 1e-3)   # metres (higher = farther) -> disparity
+        return raw
 
-    # Resize to input dimensions (model may process at a different resolution)
-    return cv2.resize(raw, (image_bgr.shape[1], image_bgr.shape[0]),
-                      interpolation=cv2.INTER_LINEAR)
+    # Pass 1 — global depth field, whole image in one inference. Note: the
+    # HF depth-estimation pipeline's own postprocessing resizes its output
+    # to match the input's resolution for every model tried here (Depth
+    # Pro and Depth Anything alike) — that shape match is NOT a signal that
+    # native detail survived, since Depth Anything's global pass demonstrably
+    # loses it (see module docstring); only `skip_tiling` above encodes that.
+    print("  [depth] global pass...", file=sys.stderr, flush=True)
+    global_depth = cv2.resize(_infer(rgb), (W, H), interpolation=cv2.INTER_LINEAR)
+
+    if skip_tiling:
+        return global_depth
+
+    # Native tile size = the model's own native input resolution. Each pass's
+    # tile *footprint* (the region of the original image each tile actually
+    # crops) defaults to that same size — a "100% zoom" tile needing ~no
+    # further downsampling — but tile_width_frac can size it as a fraction of
+    # the image's width instead, trading per-tile resolution for context.
+    proc_size   = getattr(pipe.image_processor, "size", None) or {}
+    native_tile = int(proc_size.get("height") or proc_size.get("shortest_edge") or 518)
+
+    fracs = ([tile_width_frac] if isinstance(tile_width_frac, (int, float))
+            else list(tile_width_frac) if tile_width_frac else [None])
+
+    # Each fraction gets its own independent pass aligned against the global
+    # map — not chained through each other, so one pass's blind spot (e.g. a
+    # wide pass blending steam into the sky) can't propagate into the next —
+    # and the final map is the per-pixel maximum across the global map and
+    # every pass. Max only ever pulls a value nearer, never farther, so a
+    # pass can only contribute where it's more confident something is close;
+    # it can't erase detail another pass correctly captured.
+    combined = global_depth
+    for frac in fracs:
+        footprint = max(native_tile, round(W * frac)) if frac else native_tile
+        pass_result = _tile_refine(rgb, _infer, global_depth, native_tile, footprint, tile_overlap)
+        combined = np.maximum(combined, pass_result)
+    return combined
 
 
 def _depth_blur(image, depth_raw, sigma_max, d_focus=0.0, n_levels=16):
@@ -213,6 +422,178 @@ def _depth_blur(image, depth_raw, sigma_max, d_focus=0.0, n_levels=16):
     return np.clip(_linear_to_srgb(result_lin) * 255.0, 0, 255).astype(np.uint8)
 
 
+def _otsu_sky_mask(disp, feather=3.0):
+    """Segment the farthest, most tightly-clustered region of a disparity
+    map (typically sky) via Otsu's threshold, which picks the split that
+    minimises intra-class variance — a good fit here since sky tends to sit
+    in a narrow low-disparity band clearly apart from the rest of a scene's
+    much wider spread. Returns a (H, W) float32 mask in [0, 1] (1 = sky)
+    with a lightly feathered edge so a hard per-pixel threshold doesn't
+    stairstep the blend seam.
+    """
+    d_min, d_max = float(disp.min()), float(disp.max())
+    d8 = np.clip((disp - d_min) / max(d_max - d_min, 1e-6) * 255, 0, 255).astype(np.uint8)
+    thresh, _ = cv2.threshold(d8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    mask = (d8 <= thresh).astype(np.float32)
+    return cv2.GaussianBlur(mask, (0, 0), feather)
+
+
+def _fix_sky_depth(depth_disp, image_bgr,
+                   sky_model="depth-anything/Depth-Anything-V2-Small-hf"):
+    """Corrects a Depth Pro failure mode seen on stylised/painted art: it's
+    trained on real photographs, where a flat, desaturated, silhouette-like
+    region is a strong learned cue for atmospheric distance — so it can
+    read a plainly-painted structure that way and place it *farther* than
+    the sky behind it (confirmed on a power-station painting, where Depth
+    Pro placed the sky nearer than the building in front of it, while Depth
+    Anything V2 got the same region right).
+
+    Depth Anything's map is used to both locate the sky — via
+    `_otsu_sky_mask`, since sky is its single farthest, most tightly
+    clustered region — and to supply corrected values there. The two
+    models' outputs are on different, arbitrary scales, so Depth Anything's
+    map can't be pasted in directly: it's least-squares fit (scale + shift)
+    to depth_disp's scale using the *non-sky* region, where the two models
+    should broadly agree, before its (now depth_disp-scaled) sky values are
+    blended in through the feathered mask. A final safety clamp caps the
+    sky region at the minimum non-sky disparity, guaranteeing the corrected
+    sky is at least as far as everything in front of it even if the fit
+    isn't perfect.
+    """
+    print("  [depth] sky correction: running Depth Anything V2 for sky mask...",
+          file=sys.stderr, flush=True)
+    sky_disp = _estimate_depth(image_bgr, model=sky_model)
+
+    mask = _otsu_sky_mask(sky_disp)
+
+    non_sky = mask < 0.5
+    src = sky_disp[non_sky][::4].astype(np.float64)
+    dst = depth_disp[non_sky][::4].astype(np.float64)
+    (a, b), *_ = np.linalg.lstsq(
+        np.stack([src, np.ones_like(src)], axis=1), dst, rcond=None)
+    aligned_sky = (a * sky_disp + b).astype(np.float32)
+
+    corrected = depth_disp * (1.0 - mask) + aligned_sky * mask
+
+    non_sky_min = float(depth_disp[non_sky].min())
+    return np.where(mask > 0.01, np.minimum(corrected, non_sky_min), corrected).astype(np.float32)
+
+
+def _flatten_thin_masts(depth_disp, image_bgr, sam_model="facebook/sam-vit-base",
+                        target_width=1500, min_aspect=2.0, min_height_frac=0.05,
+                        max_relative_spread=0.15, feather=2.0):
+    """Enforces near-uniform depth on thin, tall, solid vertical structures
+    (chimneys, masts) whose true depth barely varies across their height but
+    which monocular depth models can render with substantial internal noise
+    (confirmed: a power-station smokestack whose per-row disparity wobbled
+    non-monotonically by ±15 with no plausible perspective explanation).
+
+    Candidates are found via SAM's automatic mask generation (the
+    `mask-generation` pipeline) on the *source image*, not any depth map —
+    using a depth map to find its own errors is circular, and an Otsu split
+    on either Depth Pro's or Depth Anything's map here just lumps the
+    (fairly dark) smokestacks in with sky rather than isolating them (both
+    models place the smokestacks near the low, "far" end of their own
+    disparity range). An earlier classical approach (black-hat/top-hat
+    contrast + connected components) worked but was unreliable — it missed
+    a mast embedded in busy, high-contrast painted clouds entirely, since it
+    can only separate an object from a *locally uniform* backdrop.
+
+    The image is downsampled to `target_width` before running SAM: its ViT
+    encoder resizes to a fixed internal resolution regardless of input
+    size, so feeding it the full-resolution source doesn't improve mask
+    quality (confirmed empirically: full-resolution and this downsampled
+    pass produce the same mask overlap against the true mast shape) — it
+    only makes every downstream step of automatic mask generation (per-point
+    decoding, mask upsampling, NMS across ~1000 candidate masks) far more
+    expensive for no benefit (~17 minutes for one 4500px-wide image vs.
+    ~17 seconds downsampled). Each mask's own bounding-box aspect ratio
+    (height ≫ width) is enough to keep just the mast-like ones — no
+    solidity check is needed here the way the classical approach required
+    one, since SAM's masks already respect real object boundaries: the
+    transmission tower's wire lattice isn't returned as any tall/narrow
+    mask in the first place (confirmed empirically: zero overlap between
+    the tower region and any aspect-qualifying mask).
+
+    Each surviving mask's depth is *not* flattened to a single value outright
+    — a mast large enough to show some genuine perspective drift across its
+    height would lose that real variation. Instead, each pixel's deviation
+    from the mask's own median is clamped to a tolerance band (a soft
+    winsorize, not a hard replace): deviations already inside that band pass
+    through untouched, and only the excess beyond it — the part with no
+    plausible perspective explanation — gets pulled in.
+
+    That clamp is one-sided: only deviations reading *farther* than the
+    mast's own median are pulled in; deviations reading *nearer* are left
+    untouched no matter how large. A solid mast can't have something
+    genuinely farther "through" it, so an excess-far pixel is unambiguous
+    noise — but a pixel reading nearer could easily be something real
+    crossing in front of it (confirmed: a transmission wire passing over a
+    smokestack was getting its correct, nearer depth erased and pulled back
+    to the smokestack's own median before this was one-sided).
+
+    That tolerance band shrinks quadratically, not linearly, toward the
+    background. Disparity is (proportional to) inverse distance, so for a
+    mast of fixed real-world height, the disparity range its own top-to-
+    bottom depth difference could plausibly produce shrinks with the square
+    of its distance, not linearly — a mast twice as far away should be
+    allowed a quarter of the tolerance, not half. `allowed` is therefore
+    `max_relative_spread * median_val * (median_val / scene_max)`: at
+    `median_val == scene_max` (the nearest thing in the whole scene) it
+    reduces to the old linear `max_relative_spread * median_val`, and it
+    falls away quadratically for anything farther back. The result is
+    blended in through a lightly feathered mask.
+    """
+    try:
+        from transformers import pipeline as hf_pipeline
+        import torch
+        from PIL import Image as PILImage
+    except ImportError as e:
+        print(
+            f"Error: {e}\n"
+            "Mast flattening requires: pip install transformers torch pillow",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    h, w = depth_disp.shape
+    device = "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu"
+
+    scale = min(1.0, target_width / w)
+    small = cv2.resize(image_bgr, (max(1, int(w * scale)), max(1, int(h * scale))),
+                       interpolation=cv2.INTER_AREA)
+    rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+
+    print(f"  [depth] mast flattening: running SAM ({sam_model}) on "
+          f"{small.shape[1]}x{small.shape[0]} downsample...", file=sys.stderr, flush=True)
+    pipe = hf_pipeline("mask-generation", model=sam_model, device=device)
+    out  = pipe(PILImage.fromarray(rgb), points_per_batch=64, points_per_side=32)
+
+    corrected  = depth_disp.copy()
+    min_height = min_height_frac * h
+    scene_max  = max(float(depth_disp.max()), 1e-6)
+    for m in out["masks"]:
+        m = np.array(m).astype(np.uint8)
+        ys, xs = np.where(m)
+        if len(xs) == 0:
+            continue
+        bw, bh = xs.max() - xs.min(), ys.max() - ys.min()
+        if bh < min_height or bh / max(bw, 1) < min_aspect:
+            continue
+        m_full = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
+        median_val = float(np.median(depth_disp[m_full]))
+        allowed    = max_relative_spread * median_val * (median_val / scene_max)
+        # One-sided: only pull in excess-far deviations (negative); a
+        # nearer-reading pixel may be something real in front of the mast
+        # (e.g. a wire), so that side is left uncapped.
+        deviation  = np.maximum(depth_disp - median_val, -allowed)
+        target     = median_val + deviation
+        weight = cv2.GaussianBlur(m_full.astype(np.float32), (0, 0), feather)
+        corrected = corrected * (1.0 - weight) + target * weight
+
+    return corrected.astype(np.float32)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Crop and apply depth-guided variable blur for wallpaper preparation.",
@@ -238,6 +619,12 @@ def main():
     parser.add_argument("--save-depth", metavar="PATH",
                         help="Also save the normalised depth map (white=near, black=far) "
                              "alongside the main output, e.g. for barycentre_crop.py")
+    parser.add_argument("--fix-sky", action="store_true",
+                        help="Correct sky/foreground depth inversions (seen on stylised art) "
+                             "using an Otsu-segmented Depth Anything V2 sky mask")
+    parser.add_argument("--flatten-masts", action="store_true",
+                        help="Flatten thin, tall, solid vertical structures (chimneys, masts) "
+                             "to their own median depth, reducing internal depth noise")
 
     # Blur
     parser.add_argument("--blur", type=float, default=2.0, metavar="PCT",
@@ -261,6 +648,12 @@ def main():
         image = _crop_to_aspect(image, ratio_w, ratio_h, align=args.align)
 
     depth_raw = _estimate_depth(image, model=args.model)
+
+    if args.fix_sky:
+        depth_raw = _fix_sky_depth(depth_raw, image)
+
+    if args.flatten_masts:
+        depth_raw = _flatten_thin_masts(depth_raw, image)
 
     if args.save_depth:
         d_min, d_max = float(depth_raw.min()), float(depth_raw.max())
