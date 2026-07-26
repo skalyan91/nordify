@@ -618,7 +618,7 @@ def main():
                         help="Save blur-strength map as greyscale and exit (useful for tuning)")
     parser.add_argument("--save-depth", metavar="PATH",
                         help="Also save the normalised depth map (white=near, black=far) "
-                             "alongside the main output, e.g. for barycentre_crop.py")
+                             "alongside the main output")
     parser.add_argument("--fix-sky", action="store_true",
                         help="Correct sky/foreground depth inversions (seen on stylised art) "
                              "using an Otsu-segmented Depth Anything V2 sky mask")

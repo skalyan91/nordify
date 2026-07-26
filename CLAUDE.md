@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**nord-lab** is a Python CLI pipeline that prepares wallpapers in the [Nord colour palette](https://www.nordtheme.com/). `depth_blur.py` handles cropping and depth-guided blur; `nordify.py` handles palette conversion. `barycentre_crop.py` is a standalone utility for choosing a crop offset algorithmically instead of via `--align`.
+**nord-lab** is a Python CLI pipeline that prepares wallpapers in the [Nord colour palette](https://www.nordtheme.com/). `depth_blur.py` handles cropping and depth-guided blur; `nordify.py` handles palette conversion. `entropy_crop.py` is a standalone utility for choosing a crop offset algorithmically instead of via `--align`.
 
 ## Setup and Usage
 
@@ -17,9 +17,8 @@ python3 depth_blur.py <input> -o <blurred> [--aspect W:H] [--align ...] [--blur 
 # Step 2 — nordify
 python3 nordify.py <blurred> -o <output> [--dither fs] [--mix [spectral|additive]]
 
-# Optional — pick a crop offset by centreing the depth map's barycentre, apply to N images at once
-python3 depth_blur.py <input> -o <blurred> --no-crop --save-depth <depth.png>
-python3 barycentre_crop.py <depth.png> --aspect W:H <in1> <out1> [<in2> <out2> ...]
+# Optional — pick a crop offset that minimises edge-cutting entropy, apply to N images at once
+python3 entropy_crop.py <edge_source> --aspect W:H <in1> <out1> [<in2> <out2> ...]
 ```
 
 Core dependencies: `numpy`, `opencv-python-headless` (in `venv/`).  
@@ -128,12 +127,14 @@ The image is downsampled to `target_width` before running SAM. SAM's ViT encoder
 
 **`_disc_blur_mlx(img, radius)`** / **`_disc_blur_cpu(img, radius)`** — disc blur for `(H, W, C)` arrays (any C) on GPU via MLX 2-D depthwise `conv2d` (weight shape `(C, kH, kW, 1)`, `groups=C`) or CPU via `cv2.filter2D`. Both reflect-pad at boundaries.
 
-**`_depth_blur(image, depth_raw, sigma_max, d_focus=0.0, n_levels=16)`** — **layered forward-scatter compositing**. Divides depth into K=`n_levels` slabs with tent-function membership (exact partition of unity). For each slab k (front-to-back order, foreground first): packs `image × mask_k` and `mask_k` as a 4-channel array, blurs with disc radius `rₖ = sigma_max · |dₖ − d_focus| / max(d_focus, 1−d_focus)` (telecentric CoC), then composites with premultiplied alpha (`color_acc += remaining · color_k`, `weight_acc += remaining · alpha_k`). Background bokeh circles at foreground edges emerge naturally from the forward scatter — no depth dilation needed. Un-premultiplies at the end (`result / weight_acc`). `--depth-only` saves the blur-strength map `|d − d_focus| / denom` (white = max blur, black = in-focus plane); `--save-depth` saves the plain normalised depth map (no focus-relative transform) alongside the main blurred output, for `barycentre_crop.py`.
+**`_depth_blur(image, depth_raw, sigma_max, d_focus=0.0, n_levels=16)`** — **layered forward-scatter compositing**. Divides depth into K=`n_levels` slabs with tent-function membership (exact partition of unity). For each slab k (front-to-back order, foreground first): packs `image × mask_k` and `mask_k` as a 4-channel array, blurs with disc radius `rₖ = sigma_max · |dₖ − d_focus| / max(d_focus, 1−d_focus)` (telecentric CoC), then composites with premultiplied alpha (`color_acc += remaining · color_k`, `weight_acc += remaining · alpha_k`). Background bokeh circles at foreground edges emerge naturally from the forward scatter — no depth dilation needed. Un-premultiplies at the end (`result / weight_acc`). `--depth-only` saves the blur-strength map `|d − d_focus| / denom` (white = max blur, black = in-focus plane); `--save-depth` saves the plain normalised depth map (no focus-relative transform) alongside the main blurred output.
 
-## barycentre_crop.py
+## entropy_crop.py
 
-Standalone utility: picks a crop offset that centres the depth map's barycentre, then applies that offset to one or more pixel-aligned images. No edge/saliency model — reuses the depth map `depth_blur.py` already computes.
+Standalone utility: picks a crop offset that minimises the entropy of the image content it would cut, then applies that offset to one or more pixel-aligned images. No depth map needed — runs Sobel edge detection directly on the "edge source" image.
 
-**`find_crop_offset(depth_map, ratio_w, ratio_h)`** — crops whichever axis the target ratio requires narrowing (same width-vs-height test as `depth_blur.py`'s `_crop_to_aspect`). Sums the depth map's pixel values (mass) along the other axis into a marginal per-row/column profile, takes its weighted mean coordinate as the barycentre, then centres the crop window on it: `offset = round(barycentre − new_length/2)`, clamped to `[0, excess]`. A depth map with ~zero total mass (degenerate/flat) falls back to a plain centred crop.
+**`_gradient_magnitude(image_bgr)`** — continuous Sobel gradient magnitude (after a light Gaussian blur), not a thresholded edge detector like Canny — a palette-snapped image is mostly large flat colour regions, where Canny goes nearly empty and leaves pathological ties between candidate offsets.
 
-**`main()`** — reads one depth-map image, computes the offset once via `find_crop_offset`, then applies `_apply_crop` identically to every `<in> <out>` pair given (asserting each input is pixel-aligned with the depth map) — so a day/night pair of the same wallpaper crops in lock-step. `--visualize` optionally dumps the depth map with the barycentre and chosen boundary lines drawn on it, for sanity-checking.
+**`find_crop_offset(edge_source, ratio_w, ratio_h)`** — crops whichever axis the target ratio requires narrowing (same width-vs-height test as `depth_blur.py`'s `_crop_to_aspect`). For each candidate offset, scores the crop by the entropy of the gradient magnitude across the *entire* kept window, not just the single boundary row/column — but weighted by a parabola `((x − centre) / (new_length/2))²` (x = absolute position, centre = the window's own midpoint): 1 at each boundary, falling smoothly to 0 at the window's centre. This has no arbitrary cutoff width to choose (unlike a fixed-width margin band) while still concentrating the score on content near the cut: a feature deep in the kept interior contributes ~nothing, one right at the boundary contributes fully, and one a few pixels in (antialiasing, blur, a not-quite-axis-aligned object) still counts substantially. Expanding the square turns the weighted sum into a combination of three window sums — of the gradient magnitude, of position × magnitude, and of position² × magnitude — each obtainable from a prefix sum along the crop axis in O(1), so scanning every offset stays O(excess × other) despite scoring the whole window. Treating that weighted gradient magnitude as an unnormalised distribution over rows/columns, low entropy means the cut is concentrated (mostly flat, featureless, only clipping something in a narrow span) rather than smeared across many different rows/columns, i.e. many different objects; cutting nothing scores zero. Ties (common at zero entropy) break on total edge weight cut, ascending.
+
+**`main()`** — reads one edge-source image, computes the offset once via `find_crop_offset`, then applies `_apply_crop` identically to every `<in> <out>` pair given (asserting each input is pixel-aligned with the edge source) — so a day/night pair of the same wallpaper crops in lock-step. `--visualize` dumps the edge source with the chosen crop boundaries (red) drawn on it, for sanity-checking.

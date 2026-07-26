@@ -43,7 +43,7 @@ python3 depth_blur.py <input> -o <blurred> [options]
 | `--levels N` | `16` | Number of depth slabs for scatter compositing |
 | `--focus D` | `0.0` | Focus plane as normalised disparity: `0.0`=background/infinity, `1.0`=foreground |
 | `--depth-only` | — | Save the blur-strength map and exit (useful for tuning) |
-| `--save-depth PATH` | — | Also save the normalised depth map alongside the main output, e.g. for `barycentre_crop.py` |
+| `--save-depth PATH` | — | Also save the normalised depth map alongside the main output |
 | `--fix-sky` | — | Correct sky/foreground depth inversions (seen on stylised art) using an Otsu-segmented Depth Anything V2 sky mask; see [Methods](#sky-depth-correction---fix-sky) below |
 | `--flatten-masts` | — | Flatten thin, tall, solid vertical structures (chimneys, masts) to their own median depth; see [Methods](#mast-depth-flattening---flatten-masts) below |
 | `--model MODEL` | Depth Anything V2 Small | HuggingFace depth model ID |
@@ -62,21 +62,20 @@ python3 nordify.py <input> -o <output> [options]
 | `--mix [spectral\|additive]` | Palette mixing (requires MLX); see [Methods](#palette-mixing---mix) below. |
 | `--night` | Nighttime pre-processing: darken and cool the image before palette conversion |
 
-### Utility — `barycentre_crop.py`
+### Utility — `entropy_crop.py`
 
-An alternative to `depth_blur.py`'s `--align left`/`center`/`right`: picks a crop offset that centres the depth map's barycentre, then applies that same offset to one or more images — useful for re-cropping an already-finished wallpaper to a second aspect ratio (e.g. deriving a 3:2 variant from a 16:9 one) while keeping a day/night pair aligned. Needs a depth map alongside the image(s) to crop — produce one with `depth_blur.py --save-depth`. See [Methods](#barycentre-centred-crop-barycentre_croppy) below.
+An alternative to `depth_blur.py`'s `--align left`/`center`/`right`: picks a crop offset that minimises the entropy of the edge source's content it would cut, then applies that same offset to one or more images — useful for re-cropping an already-finished wallpaper to a second aspect ratio (e.g. deriving a 3:2 variant from a 16:9 one) while keeping a day/night pair aligned. The edge source is typically a depth map (`depth_blur.py --save-depth`) so the crop is chosen against object silhouettes rather than painted texture, but any image works. See [Methods](#minimum-entropy-crop-entropy_croppy) below.
 
 ```
-python3 depth_blur.py photo.jpg -o blurred.png --no-crop --save-depth depth.png
-python3 barycentre_crop.py depth.png --aspect W:H <in1> <out1> [<in2> <out2> ...]
+python3 entropy_crop.py edge_source.png --aspect W:H <in1> <out1> [<in2> <out2> ...]
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--aspect W:H` | `16:9` | Target aspect ratio |
-| `--visualize PATH` | — | Save a copy of the depth map with the barycentre and chosen crop boundaries drawn on it |
+| `--visualize PATH` | — | Save a copy of the edge source with the chosen crop boundaries drawn on it |
 
-The depth map is only used to choose the crop offset — it is not implicitly cropped; include it in the `<in> <out>` pairs if it should be too. Every input must be pixel-aligned with the depth map (i.e. the same dimensions).
+The edge source is only used to choose the crop offset — it is not implicitly cropped; include it in the `<in> <out>` pairs if it should be too. Every input must be pixel-aligned with the edge source (i.e. the same dimensions).
 
 ### Examples
 
@@ -105,10 +104,11 @@ python3 depth_blur.py photo.jpg -o blurred.png --aspect 3:2 --align left --blur 
 python3 nordify.py blurred.png -o wallpaper.png --mix
 
 # Derive a 3:2 crop from an already-finished 16:9 wallpaper (and its night
-# variant) via barycentre-centred cropping, keeping both pixel-aligned
+# variant) via minimum-entropy cropping against the depth map, keeping both
+# pixel-aligned
 python3 depth_blur.py photo.jpg -o blurred.png --no-crop --save-depth depth.png
 python3 nordify.py blurred.png -o wallpaper.png --mix
-python3 barycentre_crop.py depth.png --aspect 3:2 \
+python3 entropy_crop.py depth.png --aspect 3:2 \
     wallpaper.png wallpaper_3x2.png \
     wallpaper_night.png wallpaper_night_3x2.png
 ```
@@ -183,11 +183,13 @@ The clamp only ever pulls a pixel toward its mast's median from the *far* side, 
 
 The image is downsampled (1500px wide by default) before running SAM: its encoder resizes to a fixed internal resolution regardless of input size, so the full-resolution source produces identical mask quality at ~60x the cost (~17 minutes vs. ~17 seconds for one 4500px-wide image).
 
-### Barycentre-centred crop (`barycentre_crop.py`)
+### Minimum-entropy crop (`entropy_crop.py`)
 
-Reuses the depth map `depth_blur.py` already computes for the blur pass, rather than deriving a separate notion of "what matters" from image edges. Treats the depth map as a mass distribution over the image — each pixel's depth value (near = heavy, far = weightless) — and computes the weighted centroid along whichever axis the target aspect ratio needs to narrow. The crop window is then centred on that coordinate, clamped so it stays within the image. Because near/foreground content is usually a photo's subject, this tends to keep the subject centred without any saliency model at all.
+Slides the crop window along whichever axis the target aspect ratio needs to narrow and scores each candidate offset by how much of the edge source's content its two boundaries would cut. The edge source is usually a depth map (from `depth_blur.py --save-depth`): its edges are exactly object silhouettes, so cutting one means clipping a real object — unlike a colour image, whose Sobel edges also fire on brushwork and painted texture that have nothing to do with where objects actually are (a colour image still works if no depth map is available). Sobel gradient magnitude (continuous, not thresholded like Canny — a palette-snapped colour image is mostly flat colour and would leave Canny nearly empty) stands in for "how much is here to lose."
 
-It has no idea what a moon or a smokestack *is*, only how near each pixel is — so at aggressive crop ratios it can trade away a foreground object sitting off to one side (a second smokestack, say) to keep the *centre of mass* of everything nearby centred, rather than preserving every discrete object. It's also blind to anything distant: a background detail contributes almost no weight regardless of where it sits, so the crop is free to clip it.
+Rather than sampling only the exact boundary row/column, every row/column in the *entire* kept window contributes, weighted by a parabola that's 1 at each boundary and falls smoothly to 0 at the window's own centre — no arbitrary cutoff width to pick, while still concentrating the score on content near the cut (a clipped feature's gradient peak doesn't always land precisely on the cut line — antialiasing, blur, a not-quite-axis-aligned object). Treating that weighted gradient magnitude as an unnormalised distribution over rows/columns, entropy is low when the cut is concentrated (mostly flat, only clipping something in a narrow span) and high when it's smeared across many different objects; cutting nothing scores zero. Ties at zero entropy break on total edge weight cut, ascending — preferring the offset that clips the least even when both clip "nothing significant."
+
+It has no notion of what an object *is*, only where the edge source changes sharply — so it can occasionally prefer clipping a large, low-contrast area over a small but sharp-edged one nearby if that minimises the boundary's entropy. Its notion of foreground vs. background comes entirely from whatever edge source it's given: fed a depth map, it favours cuts that avoid silhouettes; fed a colour image, it only knows "how confidently something's outline sits on this line," with no sense of near vs. far.
 
 ### Nighttime pre-processing (`--night`)
 
