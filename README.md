@@ -41,9 +41,10 @@ python3 depth_blur.py <input> -o <blurred> [options]
 | `--no-crop` | — | Skip aspect-ratio cropping |
 | `--blur PCT` | `2.0` | Max disc radius (circle of confusion) as % of image height |
 | `--levels N` | `16` | Number of depth slabs for scatter compositing |
-| `--focus D` | `0.0` | Focus plane as normalised disparity: `0.0`=background/infinity, `1.0`=foreground |
+| `--focus D\|auto` | `0.0` | Focus plane as normalised disparity: `0.0`=background/infinity, `1.0`=foreground, or `auto` to detect the principal figure via SAM segmentation; see [Methods](#automatic-figure-detection---focus-auto) below |
 | `--depth-only` | — | Save the blur-strength map and exit (useful for tuning) |
 | `--save-depth PATH` | — | Also save the normalised depth map alongside the main output |
+| `--save-figure-mask PATH` | — | With `--focus auto`, also save the winning figure region as a mask alongside the main output |
 | `--fix-sky` | — | Correct sky/foreground depth inversions (seen on stylised art) using an Otsu-segmented Depth Anything V2 sky mask; see [Methods](#sky-depth-correction---fix-sky) below |
 | `--flatten-masts` | — | Flatten thin, tall, solid vertical structures (chimneys, masts) to their own median depth; see [Methods](#mast-depth-flattening---flatten-masts) below |
 | `--model MODEL` | Depth Anything V2 Small | HuggingFace depth model ID |
@@ -182,6 +183,16 @@ Each surviving mast isn't flattened to a single value outright — that would er
 The clamp only ever pulls a pixel toward its mast's median from the *far* side, never the near side — a mast can't have something genuinely farther "through" it, but a pixel reading nearer could be something real crossing in front (a transmission wire passing over a smokestack was losing its correct depth this way until the clamp was made one-sided).
 
 The image is downsampled (1500px wide by default) before running SAM: its encoder resizes to a fixed internal resolution regardless of input size, so the full-resolution source produces identical mask quality at ~60x the cost (~17 minutes vs. ~17 seconds for one 4500px-wide image).
+
+### Automatic figure detection (`--focus auto`)
+
+Picks the focus plane automatically instead of a manually guessed `--focus D`, by locating the principal "figure" — a compact foreground subject — via [SAM](https://github.com/facebookresearch/segment-anything) segmentation of the source image, then using its median depth as the focus plane.
+
+An earlier version segmented via classical Canny edge detection on the depth map itself instead of SAM. It worked on photos with sharp depth discontinuities, but failed on a stylised power-station painting: Canny traced the cooling tower's silhouette as a visually clear gradient, but the boundary had gaps too small to see by eye and too large for a fixed-size dilation to close, so the tower's "inside" leaked into the surrounding sky and merged into one ~90%-of-frame blob — never even considered as a candidate. SAM (already used by `--flatten-masts` above, for the same reason) has no such failure mode: it segments from the image's own visual boundaries, which are complete and unambiguous even where the depth map's inferred discontinuity is not.
+
+A single object can still come back as several SAM masks (SAM's output is hierarchical, and an occluder can split one object's mask in two). Regions whose depth ranges overlap by more than 50% of both ranges' own extents are merged (transitively, via union-find) into one candidate. Any region touching the image border is dropped *before* this merge, not after — a border-touching region is a partial view of whatever it belongs to, so nothing measured from it can be trusted, and filtering post-merge would let one small, unrelated, border-touching mask disqualify an otherwise-large, clean interior candidate purely because it coincidentally shares a similar depth (confirmed: a 5,669px sliver of sky merged into, and discarded, an otherwise-clean 348,847px cooling-tower group before this was fixed).
+
+Each merged candidate is ranked on five criteria via weighted rank-sum: **area** (weight 6 — deliberately the heaviest, since shape criteria alone let a small, incidentally cleaner-shaped blob beat a correctly-identified but 10x-larger subject), **chunkiness** (weight 2 — the fraction of a mask's area surviving erosion by a radius proportional to its own size; unlike bounding-box aspect ratio, this tells a solid tall structure like a cooling tower apart from a thin sliver of the same elongation, since only the sliver erodes away), **solidity** (weight 2 — mask area / convex-hull area), **connectedness** (weight 2 — largest spatial blob / total merged area, penalising a merge of same-depth but spatially disjoint objects), and **median depth** (weight 1 — nearer wins). Ties are averaged rather than broken by list order, since many candidates genuinely tie at connectedness = 1.0.
 
 ### Minimum-entropy crop (`entropy_crop.py`)
 
