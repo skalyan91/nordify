@@ -210,6 +210,7 @@ Transforms pixel colours in Oklab before palette conversion:
 
 - **Luminance** — `L → 1 − √(1 − L)`: a curve that darkens mid-tones and highlights while keeping shadows from crushing to black.
 - **Yellow/blue axis** — `b` is shifted toward blue in inverse proportion to luminance: dark pixels receive the full shift (warming tones become cool), bright pixels are left unchanged (artificial lights and highlights keep their original colour temperature).
+- **Detected lights** — a lit window or streetlight should stay bright at night, not just avoid being darkened, but picking it out from an ordinary bright or colourful pixel (a sunlit orange, a patch of sky) needs more than a per-pixel colour rule can see: what actually makes something read as "a light" is standing out sharply from its *immediate surroundings*, not any absolute brightness or colour value. Each compact spot substantially brighter than its own neighbourhood — at whatever spatial scale it happens to be, found via multi-scale Difference-of-Gaussians blob detection (the same core idea behind SIFT keypoints) on the lightness channel — is protected from both effects above and additionally brightened, feathered smoothly around each detected spot. No segmentation model or depth map needed: local contrast alone is exactly the signal that defines a light.
 
 ## Nord Palette
 

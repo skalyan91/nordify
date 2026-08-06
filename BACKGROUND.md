@@ -96,3 +96,53 @@ Simply projecting each out-of-gamut pixel onto its nearest point on the hull wou
 An earlier attempt split chrominance further, into a hue phase and then a chroma phase run sequentially — mirroring the phase structure historically used for Kubelka-Munk mixing above. It converges to a similar-looking result, but far more slowly: separating hue from chroma means each phase's loss carries its own 1000× penalty term guarding the phase(s) before it, and that layered ill-conditioning needs many more optimiser steps to settle. Matching (a, b) jointly sidesteps the problem, since hue and chroma are just polar coordinates of the same two numbers — there is no reason to solve for them one at a time.
 
 Each phase runs [Adam](https://en.wikipedia.org/wiki/Stochastic_gradient_descent#Adam), whose per-coordinate adaptivity is what makes the penalty term tractable at all — plain gradient descent, tried first, stalled badly on phase 2's ill-conditioned loss. But an unconstrained Adam step could easily propose a colour outside the gamut again. So after every step, the candidate colour is re-projected onto the hull via the same half-space projection used for initialisation — meaning the *effective* step taken is not the raw Adam update but (projected candidate − current colour): whatever part of the update would have left the gamut is silently clipped away, and optimisation continues from wherever that leaves the pixel. This is the same principle as projected gradient descent in convex optimisation: take an ordinary step, then project back onto the feasible set, repeat.
+
+## Automatic figure detection: a parafoveal acuity model
+
+### The problem with hand-picked criteria
+
+`depth_blur.py --focus auto` has to pick a focus plane without being told what the subject of a photo is. An early version did this by segmenting the image and scoring each candidate region on five hand-picked criteria — size, a compactness measure, convexity, spatial connectedness, depth — combined by weights tuned reactively against whichever test image had just broken. That is a genuinely *underdetermined* procedure: nothing but trial and error against a couple of photos justified any particular weight, and there was no way to know whether it would generalise.
+
+The fix was to stop scoring proxies for "looks like a subject" and instead model something concrete and measurable: how sharply a human viewer would actually resolve each part of the image. "The figure" becomes whichever candidate region has the greatest total *resolvable* area under that model — one principled quantity instead of five arbitrary ones.
+
+### Viewing geometry, without knowing the screen
+
+Modelling visual acuity first requires knowing how far a point on the image sits from where the viewer is looking, in degrees of visual angle rather than pixels. That requires an assumed viewing distance — but the pipeline has no idea what physical display the output will end up on, or at what resolution.
+
+The way out: define the viewing distance as a multiple of the image's *own* diagonal (1.5×, a typical comfortable viewing ratio for a display filling much of the field of view) rather than as an absolute physical distance. A pixel `r` pixels from the frame's centre — the assumed fixation point, the only defensible default with no gaze data — then subtends a visual angle of
+
+> eccentricity = arctan(r / (1.5 · diagonal_px))
+
+Both `r` and the diagonal are measured in the same pixel units, so the unknown physical size of a real pixel cancels out of the ratio completely. The formula needs nothing about the eventual display beyond the assumption that the image will be viewed comfortably, filling a consistent fraction of the visual field regardless of its actual size.
+
+### Cortical magnification
+
+Visual acuity is sharpest at the point of fixation and falls off with eccentricity — not linearly, and not with a hard cutoff at some "foveal radius," but smoothly, in a way well characterised by vision science. The cortical magnification factor — roughly, how much retinal/cortical area is devoted to processing a given patch of visual field — follows an inverse relationship with eccentricity first described by [Rovamo & Virsu (1979)](https://doi.org/10.1007/BF00236627), and the same falloff underlies gaze-contingent computer graphics (e.g. Guenter et al., [*Foveated 3D Graphics*](https://doi.org/10.1145/2366145.2366183), 2012):
+
+> acuity(e) = 1 / (1 + e / E2)
+
+where `E2` is the eccentricity at which acuity has fallen to half its foveal value — taken here as ≈2.3°, a standard value in that literature. At `e = 0` this is 1; it decays smoothly and asymptotically thereafter, never reaching exactly zero. There is no free radius parameter to hand-pick — every quantity in the model (viewing distance ratio, `E2`) has an independent, citable meaning.
+
+### Combining with depth
+
+Acuity alone can't tell a large, cleanly-segmented but *distant* region (a patch of sky) from an equally large, equally central *near* one — eccentricity says nothing about depth. Nearness is folded into the same per-pixel weight as a second multiplicative factor: normalised disparity, 0 at the scene's own farthest point and 1 at its nearest. "The figure" is then the segmented region (candidates from [SAM](https://github.com/facebookresearch/segment-anything)'s automatic mask generation, chosen over classical edge detection because it segments from the image's own visual boundaries rather than the depth map's often-incomplete inferred ones) with the greatest total `acuity × nearness`-weighted area.
+
+## Minimum-entropy cropping, reusing the same model
+
+`entropy_crop.py` needs a related but inverted quantity: not "how well would a viewer see this," but "how much would be lost if this position were cut off" by a candidate crop boundary. That is the complement of acuity in the same model — `e / (e + E2)`, 0 at a candidate crop window's own centre and rising toward 1 at its edge — replacing an earlier, purely geometric parabola of the same shape but with no arbitrary exponent to have picked.
+
+One consequence of the change: a parabola is a polynomial in position, so a weighted sum over every candidate crop offset could be computed in closed form from a handful of prefix sums. The acuity-derived weight involves an arctangent and a division, so that shortcut no longer applies — the weighted sum for every offset is instead computed as a single batched FFT correlation, restoring the same practical speed for an arbitrary (non-polynomial) weight shape.
+
+## Detecting lights at night: scale-space blob detection
+
+### What actually makes something read as "a light"
+
+`nordify.py --night` darkens and cools an image to suggest nighttime, but a real light source — a lit window, a streetlamp, the moon — should stay bright rather than dim along with everything else. The natural question, "is this pixel bright?", turns out to be the wrong one: a white shirt in daylight is bright, but so is everything around it, and it isn't "a light." What actually makes something read as a light source is standing out sharply from its *immediate surroundings* — local contrast, not any absolute brightness or colour value. That signal isn't visible to a rule operating on one pixel's own colour at a time; it requires looking at a neighbourhood.
+
+### Difference-of-Gaussians as a blob detector
+
+Subtracting two different-width Gaussian blurs of the same image — a Difference-of-Gaussians, or DoG — approximates the Laplacian of a Gaussian and responds strongly at blob-like features whose size matches the scale spanned by the two blur radii: at the centre of a bright spot on a dark background, a narrower blur still mostly reflects the spot's own bright value, while a wider blur has averaged in more of the dark surround and reads lower, so the difference is large and positive there. This is the same core mechanism behind [SIFT](https://en.wikipedia.org/wiki/Scale-invariant_feature_transform) keypoint detection — a Gaussian scale-space pyramid, with feature points found as local extrema of the DoG response.
+
+Running this at several scales at once (rather than picking one fixed blur radius) lets both a small, sharp streetlight and a larger, softer glow register as blobs, each at whichever scale matches its own size — a local maximum in the DoG response, both across neighbouring pixels and across neighbouring scales, marks a detected light. Requiring a genuine local maximum — not merely an elevated DoG value — is what excludes plain edges and gradients, which have elevated response over an extended region but no compact spatial peak.
+
+This was chosen over a segmentation-based alternative (e.g. running SAM and comparing each proposed mask's brightness against a surrounding ring) for being far simpler while capturing exactly the same underlying signal: no ML model, no depth map, and no extra dependency — local contrast in the lightness channel alone is already the thing that defines a light.
