@@ -594,38 +594,6 @@ def _flatten_thin_masts(depth_disp, image_bgr, sam_model="facebook/sam-vit-base"
     return corrected.astype(np.float32)
 
 
-def _rank(values):
-    """Average ("fractional") rank of each value, 0 = smallest.
-
-    Tied values share the mean of the ranks they'd jointly occupy, rather
-    than each grabbing a distinct ordinal rank via plain double-argsort.
-    Plain ordinal ranking breaks ties by whatever order the values happen
-    to appear in the input list — for a criterion like `connectedness`,
-    where a large fraction of candidates genuinely tie at exactly 1.0 (a
-    single coherent SAM mask), that tie-break is pure noise, not signal,
-    and it can spread a tied block across nearly the whole rank range
-    (confirmed: two candidates both at connectedness=1.0 landed at ranks 2
-    and 12 out of 14 — a 10-rank, double-weighted swing from nothing but
-    incidental list order). Averaging collapses every tied block to one
-    shared rank, so equal values score equally.
-    """
-    values = np.asarray(values, dtype=np.float64)
-    order = np.argsort(values)
-    ranks = np.empty(len(values))
-    ranks[order] = np.arange(len(values))
-    sorted_vals = values[order]
-    i = 0
-    n = len(values)
-    while i < n:
-        j = i
-        while j + 1 < n and sorted_vals[j + 1] == sorted_vals[i]:
-            j += 1
-        if j > i:
-            ranks[order[i:j + 1]] = ranks[order[i:j + 1]].mean()
-        i = j + 1
-    return ranks
-
-
 class _UnionFind:
     """Minimal union-find (path compression, no union-by-rank — the region
     counts here are far too small for that to matter)."""
@@ -656,67 +624,94 @@ def _ranges_overlap_50(lo1, hi1, lo2, hi2):
     return inter / max(hi1 - lo1, 1e-9) > 0.5 and inter / max(hi2 - lo2, 1e-9) > 0.5
 
 
-def _chunkiness(mask, area, erosion_frac=0.1):
-    """Fraction of `mask`'s area that survives erosion by a disk of radius
-    `erosion_frac` × its own equivalent-circle radius `sqrt(area / pi)`.
+def _foveal_weight_map(h, w, viewing_distance_factor=1.5, e2_degrees=2.3):
+    """(H, W) float32 map of parafoveal acuity weight: 1.0 at the frame's
+    own centre (the assumed fixation point — no gaze data is available, so
+    "looking straight at the image" is the only defensible default) falling
+    off smoothly with eccentricity, asymptotically toward 0 but never
+    reaching it exactly — a gradient, not a hard foveal/non-foveal cutoff.
 
-    This replaces bounding-box aspect ratio ("squareness") as the
-    tolerant-of-elongation compactness criterion: aspect ratio can't tell a
-    solid, tall structure (a cooling tower, a chimney — substantial cross-
-    section at every height) apart from a thin sliver of the same
-    elongation (a wire, an edge-detection noise strip, one leg of a
-    lattice tower) — both score near 0 on min(w,h)/max(w,h) even though
-    only one of them is a real compact object. Erosion tests the thing
-    that actually distinguishes them: local *thickness*. A thin sliver's
-    width is small in absolute terms, so eroding by even a modest radius
-    wipes it out almost entirely; a solid shape's cross-section survives a
-    proportionally-sized erosion largely intact no matter how tall it is,
-    because erosion only eats a fixed-radius margin off *every* boundary,
-    and a long solid shape's boundary is almost all sides, not ends.
+    Eccentricity comes from a simple viewing-geometry assumption: the
+    viewer sits at a distance of `viewing_distance_factor` times the
+    image's own diagonal. A pixel `r` pixels from the centre then subtends
+    a visual angle of `arctan(r / (viewing_distance_factor · diagonal_px))`
+    from the fixation point — note this needs no assumption about the
+    display's actual physical size or DPI: both `r` and the diagonal are
+    measured in the same pixel units, and the unknown physical pixel pitch
+    that would convert them to real-world distance cancels out of the
+    ratio entirely, since the viewing distance is defined as a multiple of
+    that same diagonal.
 
-    The erosion radius scales with the *region's own* size (via its
-    equivalent-circle radius) rather than a fixed pixel count, so this
-    stays scale-invariant across differently-sized candidates and
-    differently-sized images — the same fraction test applies whether the
-    candidate is a 200px or 2000px structure.
+    Acuity itself falls off with eccentricity roughly as cortical
+    magnification does: `M(e) = M0 / (1 + e/E2)`, where `e` is eccentricity
+    in degrees and `E2` is the eccentricity at which acuity has halved
+    (Rovamo & Virsu 1979; the same falloff underlies most foveated-
+    rendering work, e.g. Guenter et al. 2012's gaze-contingent renderer).
+    `E2 ≈ 2.3°` is a standard value in that literature. This — not an
+    arbitrarily-chosen Gaussian sigma — is what makes the "is this pixel
+    foveal" question gradient rather than a guessed hard boundary: there
+    is no free radius parameter to tune, only quantities with an
+    independent, citable meaning (viewing distance, half-acuity
+    eccentricity).
     """
-    r = max(1, round(erosion_frac * np.sqrt(area / np.pi)))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
-    eroded = cv2.erode(mask.astype(np.uint8), kernel)
-    return float(eroded.sum()) / area
+    cy, cx = (h - 1) / 2.0, (w - 1) / 2.0
+    diag_px = float(np.hypot(h, w))
+    viewing_distance_px = viewing_distance_factor * diag_px
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+    r_px = np.hypot(xs - cx, ys - cy)
+    eccentricity_deg = np.degrees(np.arctan(r_px / viewing_distance_px))
+    return (1.0 / (1.0 + eccentricity_deg / e2_degrees)).astype(np.float32)
 
 
 def _detect_figure_focus(depth_raw, image_bgr, sam_model="facebook/sam-vit-base",
-                         target_width=1500, min_area_frac=0.0005, max_area_frac=0.5):
-    """Locate the principal "figure" — a compact foreground subject — via
-    SAM segmentation of the source image, and return its median depth,
-    normalised the same way `_depth_blur` normalises `depth_raw`, ready to
-    use as `d_focus`.
+                         target_width=1500, min_area_frac=0.0005, max_area_frac=0.5,
+                         viewing_distance_factor=1.5, e2_degrees=2.3):
+    """Locate the principal "figure" — the segmented region with the
+    greatest *parafoveally- and depth-weighted* extent — and return its
+    median depth, normalised the same way `_depth_blur` normalises
+    `depth_raw`, ready to use as `d_focus`.
 
-    Candidates come from SAM's automatic mask generation (the
-    `mask-generation` pipeline) on the *source image*, not from classical
-    edge detection on the depth map — the same trade this module already
-    made for `_flatten_thin_masts`, and for the same reason. An earlier
-    version of this function ran Canny on the depth map and connected-
-    component-labelled the non-edge pixels, exactly as `_flatten_thin_masts`
-    originally did before it switched to SAM. It worked on photos with
-    genuinely sharp depth discontinuities, but failed on a stylised power-
-    station painting: Canny traced the cooling tower's silhouette as a
-    clearly visible gradient, but the boundary had gaps too small to see by
-    eye and too large for a fixed-size dilation to close at that image's
-    resolution — enough for the "inside" of the tower to leak into the
-    surrounding sky and merge into one connected blob covering ~90% of the
-    frame (confirmed by rendering that raw connected component: sky,
-    mountains, tower, and smokestacks all one undifferentiated region). The
-    tower was never even considered as its own candidate — no amount of
-    downstream ranking can recover from a segmentation stage that never
-    isolated it. SAM has no such failure mode here: it segments from the
-    image's own visual boundaries (brushwork, colour, contrast), which are
-    complete and unambiguous on this image even where the depth map's
-    inferred discontinuity is not — and this is the same image
-    `_flatten_thin_masts`'s docstring already documents SAM succeeding on
-    where a classical contrast-based approach missed a mast entirely
-    against busy painted clouds.
+    This replaces an earlier version that picked "the figure" via five
+    hand-picked shape criteria (size, a compactness measure, convexity,
+    connectedness, depth) combined by weights tuned reactively against
+    whichever test image had just broken — a genuinely underdetermined
+    procedure, since nothing but trial and error against a couple of
+    photos justified any of those particular weights. This version instead
+    grounds "the figure" in an explicit, testable model of what a human
+    viewer would actually resolve as one: it estimates, pixel by pixel,
+    how sharply a viewer looking at the image's own centre could perceive
+    that pixel, and calls "the figure" whichever segmented region has the
+    most *total resolvable area* under that model — a single principled
+    quantity in place of five arbitrarily-weighted ones. See
+    `_foveal_weight_map` for the acuity model itself (viewing distance =
+    `viewing_distance_factor` × the image's own diagonal; falloff via
+    cortical magnification, `E2 = e2_degrees`).
+
+    Spatial (foveal) weight alone still can't tell a large, cleanly-
+    segmented but *distant* region (a patch of sky) from an equally large,
+    equally central *near* one, since eccentricity says nothing about
+    depth — confirmed: a photo's sky won outright over its actual subject
+    (fruit and foliage) before this was fixed. Nearness is folded into the
+    same per-pixel weight as a second multiplicative factor — normalised
+    disparity, `(depth_raw − d_min) / (d_max − d_min)`, 0 at the scene's
+    own farthest point and 1 at its nearest — rather than scored as a
+    separate ranking criterion. This needs no extra free parameter beyond
+    the depth map's own range, and, like the foveal falloff, is a smooth
+    gradient rather than a hard near/far cutoff.
+
+    Candidates still come from SAM's automatic mask generation on the
+    *source image*, not from classical edge detection on the depth map —
+    the same trade this module already makes for `_flatten_thin_masts`,
+    and for the same reason. An earlier version of this function ran Canny
+    on the depth map and connected-component-labelled the non-edge pixels;
+    it worked on photos with genuinely sharp depth discontinuities, but
+    failed on a stylised power-station painting, where the depth map's
+    silhouette gradient had gaps too small to see by eye and too large for
+    a fixed-size dilation to close, leaking the "inside" of a cooling tower
+    into the surrounding sky as one ~90%-of-frame blob — the tower was
+    never even considered as a candidate. SAM segments from the image's
+    own visual boundaries instead, which are unambiguous even where the
+    depth map's inferred discontinuity is not.
 
     The image is downsampled to `target_width` before running SAM, exactly
     as `_flatten_thin_masts` does and for the same reason: SAM's ViT
@@ -731,102 +726,44 @@ def _detect_figure_focus(depth_raw, image_bgr, sam_model="facebook/sam-vit-base"
     A single object can still come back as several SAM masks — SAM's
     output is hierarchical (whole object and sub-parts both proposed) and
     a mask can be split by an occluder crossing in front of it — even
-    though every piece sits at the same depth. Those pieces are merged back
-    together before
-    ranking: any two regions whose depth ranges (10th-90th percentile of
-    their own pixels, robust to a few stray boundary pixels) overlap by
-    more than 50% of *both* ranges (`_ranges_overlap_50`) are treated as
-    one figure. This is a graph problem, not a single pairwise pass — three
-    regions can chain together (A-B and B-C both overlap enough even if A-C
-    doesn't) — so it's resolved with union-find over all pairs, and each
-    resulting connected group's pixel masks are OR-ed into one candidate
-    mask.
+    though every piece sits at the same depth. Regions whose depth ranges
+    (10th-90th percentile of their own pixels, robust to a few stray
+    boundary pixels) overlap by more than 50% of *both* ranges
+    (`_ranges_overlap_50`) are merged via union-find (`_UnionFind`) — a
+    graph problem, not a single pairwise pass, since three regions can
+    chain together (A-B and B-C both overlap enough) even if A and C don't
+    directly overlap. Matching depth alone says nothing about whether the
+    result is spatially one object, though — a scene full of similar-depth
+    clutter (leaf clusters scattered through a tree canopy, say) can merge
+    into one large but disconnected union — so each merged union is split
+    back into its connected components before scoring, and each component
+    becomes its own candidate. This guarantees every candidate that
+    actually reaches scoring is one spatially contiguous piece, without
+    reintroducing a scored shape preference the way the old connectedness
+    criterion was — it's just the baseline requirement that a candidate be
+    *a* region, not a scattered union of several.
 
-    Each merged candidate is scored on five criteria and combined by a
-    **weighted rank sum** (each candidate's rank — 0 = worst — on one
-    criterion, scaled by that criterion's weight, summed across all five)
-    rather than a weighted or min-max-normalised score built from the raw
-    quantities: the quantities live on incomparable scales (pixel counts
-    vs. ratios vs. raw disparity), so weighting the *ranks* (already a
-    common, comparable 0..N-1 scale) sidesteps having to calibrate a
-    trade-off between raw units while still letting some criteria dominate
-    the others. Ties are shared, not arbitrarily split — `_rank` averages
-    the ranks of equal values rather than breaking ties by list order,
-    which matters here because a criterion like connectedness genuinely
-    ties at 1.0 for most candidates (a single coherent SAM mask), and an
-    unbroken tie shouldn't swing a double-weighted criterion based on
-    nothing but incidental ordering.
+    Candidates smaller than `min_area_frac` of the image are dropped
+    before merging — a cheap early filter for SAM's smallest sub-part
+    proposals, not a correctness-critical one: a truly tiny region would
+    lose on total foveal weight anyway (it's capped at 1.0 per pixel, so a
+    handful of pixels can never outweigh a real object spanning thousands
+    of them), so this exists mainly to avoid unnecessary work. Merged
+    candidates larger than `max_area_frac` (background spanning most of
+    the frame) are dropped after merging — this one *is* still load-
+    bearing under the new model: a sky/background region can span the
+    frame's highest-weight central pixels too, and summed over its far
+    larger total area its foveal mass can still exceed a real bounded
+    subject's, exactly the failure mode `max_area_frac` exists to catch.
 
-    Area carries weight 6 — enough to overcome losing on any two of the
-    double-weighted shape criteria, not enough to overcome all three plus
-    depth. Chunkiness, convexity, and connectedness carry weight 2; depth
-    carries weight 1. Shape still matters more than merely being the
-    nearest thing in frame (a near, ragged, scattered blob is exactly the
-    false-positive pattern — a foreground clutter of unrelated same-depth
-    objects — this ranking needs to reject), but not more than being
-    substantially the largest candidate: confirmed necessary when a
-    correctly-segmented cooling tower (257,310px) lost outright to an
-    incidental dark-bush blob (23,824px, 10.8x smaller) that merely had
-    marginally better chunkiness/solidity/depth, before area's weight was
-    raised from 1.
-        - size          — pixel count; larger wins. Weight 6.
-        - chunkiness    — `_chunkiness`: fraction of the mask's area
-                          surviving erosion by a radius proportional to its
-                          own size; closer to 1 wins. A proxy for "one
-                          compact, *solid* subject" that — unlike bounding-
-                          box aspect ratio — doesn't penalise a shape merely
-                          for being tall or elongated, only for being thin:
-                          a cooling tower or chimney is exactly as
-                          "chunky" as a round subject of the same cross-
-                          sectional substance, while a wire, a lattice-
-                          tower strut, or a thin sliver of edge-detection
-                          noise erodes away almost entirely. Weight 2.
-        - convexity     — mask area / convex-hull area (solidity); closer
-                          to 1 wins. A real solid subject is mostly convex;
-                          a merge that stitched together far-apart same-
-                          depth pieces produces a hull that balloons out to
-                          cover the gap between them, tanking this score.
-                          Weight 2.
-        - depth         — median raw disparity within the mask; higher
-                          (nearer) wins. Weight 1.
-        - connectedness — area of the merged mask's largest single spatial
-                          blob / the merged mask's total area; closer to 1
-                          wins. Depth-range merging is deliberately blind
-                          to spatial position, so this is what actually
-                          penalises a merge of two same-depth but
-                          spatially disjoint objects (e.g. two unrelated
-                          background elements at a similar distance) —
-                          solidity penalises the *gap* between such pieces
-                          but not fragmentation with no gap-spanning hull
-                          cost (pieces already near each other). Weight 2.
-
-    Candidates smaller than `min_area_frac` of the image (SAM proposes
-    masks down to a few pixels — fine detail, not noise, but too small to
-    be "the figure") are dropped before merging; merged candidates larger
-    than `max_area_frac` (background spanning most of the frame) are
-    dropped after. `min_area_frac` defaults small (0.05%) rather than to a
-    size that would already read as "a subject" on its own: a real figure
-    can be genuinely small in frame (a single piece of fruit among many, a
-    distant animal), and rejecting it here would just leave the border/
-    solidity/ranking criteria below with nothing legitimate to find —
-    whereas an over-loose min_area_frac costs only a little wasted work on
-    small candidates that the later criteria (especially chunkiness and
-    solidity, weighted double) reject on shape anyway.
-
-Any region touching the image border is discarded outright before
-    merging, regardless of how well it otherwise scores: a region cut off
-    by the frame is a partial view of whatever it belongs to (cropped by
-    the photo, not by a real object boundary), so its size and shape can't
-    be measured from it at all — the standard "exclude on edges" rule from
-    classical particle/blob analysis. This has to happen *before* the
-    depth-range merge, not after: a large, otherwise-clean interior
-    candidate can end up unioned with a small, unrelated, border-touching
-    mask on nothing more than a coincidental shared depth range (confirmed
-    — a 5,669px sliver of sky merged into, and disqualified, an otherwise
-    clean 348,847px cooling-tower group when this check ran post-merge).
-    Filtering border-touching regions first sidesteps that entirely: a
-    union of masks that each avoid the border can never touch the border
-    either.
+    Unlike the earlier version, a region touching the image border is
+    *not* specially excluded. That exclusion existed only to protect
+    shape criteria (aspect ratio, convexity) that need to see a region's
+    whole outline to mean anything — this version has no such criteria
+    left to protect. A partially-visible figure's true foveal mass is
+    merely underestimated by whatever's cropped off, exactly like any
+    other area-based measure applied to a partial view; it no longer needs
+    a categorical cutoff on top of that.
 
     Falls back to 0.0 (background/infinity focus, this module's existing
     default) if segmentation finds no surviving candidate at all.
@@ -871,19 +808,6 @@ Any region touching the image border is discarded outright before
         area = int(mask.sum())
         if area < min_area_frac * total_px:
             continue
-        # Drop border-touching regions *before* merging, not just after:
-        # a union of masks that each avoid the border can never itself
-        # touch the border, but the converse isn't safe to rely on — a
-        # single small, unrelated, border-touching SAM mask (e.g. a sliver
-        # of sky) that happens to share a large interior candidate's depth
-        # range would otherwise merge into it and disqualify the whole
-        # group on the strength of a coincidence (confirmed: a 5,669px
-        # border-touching mask merged into, and discarded, an otherwise
-        # clean 348,847px cooling-tower group). Filtering here makes a
-        # merged group's own border check below unreachable in practice,
-        # but it's kept as a defensive backstop.
-        if mask[0, :].any() or mask[-1, :].any() or mask[:, 0].any() or mask[:, -1].any():
-            continue
         d_lo, d_hi = np.percentile(depth_raw[mask], [10, 90])
         # A region of near-uniform depth (common — flat surfaces, solid-
         # colour painted objects) has a near-zero-width percentile range.
@@ -914,77 +838,61 @@ Any region touching the image border is discarded outright before
     for i in range(len(regions)):
         groups.setdefault(uf.find(i), []).append(i)
 
+    # Combine spatial (foveal) and depth weighting into one per-pixel map,
+    # rather than scoring them as separate criteria: nearness is folded in
+    # as normalised disparity (0 = the scene's own farthest point, 1 = its
+    # nearest), needing no extra free parameter beyond the depth map's own
+    # range, and — like the foveal falloff — a smooth gradient rather than
+    # a hard near/far cutoff. Without it, a large, cleanly-segmented but
+    # *distant* region (a patch of sky) can out-score every closer subject
+    # on spatial extent alone, since nothing otherwise distinguishes a
+    # near subject from a far one — confirmed: an orange tree's sky won
+    # outright over its fruit and foliage before this was added.
+    foveal_weight = _foveal_weight_map(h, w, viewing_distance_factor, e2_degrees)
+    depth_weight = (depth_raw - d_min) / (d_max - d_min)
+    combined_weight = foveal_weight * depth_weight
+
     candidates = []
     for idxs in groups.values():
-        mask = np.zeros((h, w), dtype=bool)
+        merged_mask = np.zeros((h, w), dtype=bool)
         for i in idxs:
-            mask |= regions[i]["mask"]
+            merged_mask |= regions[i]["mask"]
 
-        # A region touching the image border is only a partial view of
-        # whatever it belongs to — cut off by the crop, not by a real
-        # object boundary — so nothing measured from it (size, chunkiness,
-        # convexity, connectedness) can be trusted: the true object may
-        # continue, in any shape, beyond the frame. This is the standard
-        # "exclude on edges" rule from classical particle/blob analysis
-        # (e.g. ImageJ's "Exclude on edges"). Border-touching *regions* are
-        # already dropped before merging above, so no group reaching this
-        # point can touch the border either (a union of border-avoiding
-        # masks can't touch the border) — this check is now unreachable in
-        # practice, kept only as a defensive backstop.
-        if mask[0, :].any() or mask[-1, :].any() or mask[:, 0].any() or mask[:, -1].any():
-            continue
-
-        area = int(mask.sum())
-        if area > max_area_frac * total_px:
-            continue
-
-        mask_u8 = mask.astype(np.uint8)
-        contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            continue
-        hull_area = cv2.contourArea(cv2.convexHull(np.concatenate(contours, axis=0)))
-        if hull_area < 1:
-            continue
-
-        n_cc, _, cc_stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
-        largest_blob = float(cc_stats[1:, cv2.CC_STAT_AREA].max()) if n_cc > 1 else float(area)
-
-        candidates.append({
-            "area": area,
-            "chunkiness": _chunkiness(mask, area),
-            "solidity": area / hull_area,
-            "median_depth": float(np.median(depth_raw[mask])),
-            "connectedness": largest_blob / area,
-            "mask": mask,
-        })
+        # A depth-range merge can glue together spatially disjoint pieces
+        # that only coincidentally share a depth range — several separate
+        # leaf clusters scattered through a tree canopy, all at a similar
+        # distance, for instance — since matching depth alone says nothing
+        # about whether the result is actually one contiguous object.
+        # Splitting back into connected components is the structural fix:
+        # every candidate that reaches scoring is, by construction, one
+        # spatially contiguous piece. This isn't a scored shape preference
+        # the way the old connectedness criterion was — just the baseline
+        # requirement that a candidate actually be *a* region, not a
+        # scattered union of several.
+        mask_u8 = merged_mask.astype(np.uint8)
+        n_cc, cc_labels, cc_stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+        for label in range(1, n_cc):
+            area = int(cc_stats[label, cv2.CC_STAT_AREA])
+            if area < min_area_frac * total_px or area > max_area_frac * total_px:
+                continue
+            piece_mask = cc_labels == label
+            candidates.append({
+                "area": area,
+                "weighted_mass": float(combined_weight[piece_mask].sum()),
+                "median_depth": float(np.median(depth_raw[piece_mask])),
+                "mask": piece_mask,
+            })
 
     if not candidates:
         print("  [focus] no figure candidate found; falling back to d_focus=0.0",
               file=sys.stderr, flush=True)
         return 0.0, None
 
-    # Area carries the heaviest weight: a large size advantage should be
-    # able to overcome losing on any two of the double-weighted shape
-    # criteria (6 > 2+2), though not all three of them plus depth combined
-    # (6 <= 2+2+2). Confirmed necessary on a real case, not just tuned to
-    # one: SAM correctly segmented a cooling tower as a clean, 257,310px,
-    # non-border-touching mask, but a small (23,824px) incidental dark-bush
-    # blob nearby was *shaped* slightly better (higher chunkiness,
-    # solidity, and nearer depth) and used to win outright at area weight
-    # 1-4 despite being 10.8x smaller — clearly the wrong pick for "the
-    # figure" of the image. Weight 5 is the exact tipping point for that
-    # case; 6 leaves a real margin rather than sitting on the edge of it.
-    total = (6 * _rank([c["area"] for c in candidates])
-             + 2 * _rank([c["chunkiness"] for c in candidates])
-             + 2 * _rank([c["solidity"] for c in candidates])
-             + 1 * _rank([c["median_depth"] for c in candidates])
-             + 2 * _rank([c["connectedness"] for c in candidates]))
-    best = candidates[int(np.argmax(total))]
+    best = max(candidates, key=lambda c: c["weighted_mass"])
 
     d_focus = (best["median_depth"] - d_min) / (d_max - d_min)
     print(f"  [focus] figure detected: area={best['area']}px "
-          f"chunkiness={best['chunkiness']:.2f} solidity={best['solidity']:.2f} "
-          f"connectedness={best['connectedness']:.2f} -> d_focus={d_focus:.3f}",
+          f"weighted_mass={best['weighted_mass']:.0f} -> d_focus={d_focus:.3f}",
           file=sys.stderr, flush=True)
     return d_focus, best["mask"]
 
@@ -1035,8 +943,9 @@ def main():
     parser.add_argument("--focus", type=_focus_type, default=0.0, metavar="D",
                         help="Focus plane as normalised disparity: 0.0=background/infinity "
                              "(default), 1.0=foreground, or 'auto' to detect the principal "
-                             "figure via classical edge detection/segmentation of the depth "
-                             "map and focus on its median depth")
+                             "figure via SAM segmentation, weighted by a parafoveal acuity "
+                             "model (viewer at 1.5x the image diagonal), and focus on its "
+                             "median depth")
     parser.add_argument("--save-figure-mask", metavar="PATH",
                         help="With --focus auto, also save the winning figure region as a "
                              "greyscale mask (white=figure) alongside the main output")

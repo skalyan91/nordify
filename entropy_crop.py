@@ -7,17 +7,24 @@ needs narrowing and evaluates, at each candidate offset, the gradient
 magnitude across the *entire* kept region — not just the single boundary
 line itself, since a feature can sit a few pixels inside the cut
 (antialiasing, blur, an object that isn't perfectly axis-aligned) and still
-be the thing that gets clipped. Each row/column is weighted by a parabola
-that is 0 at the crop's own centre and rises to 1 at each boundary, so
-content right at the cut counts fully, content near it still counts
-somewhat, and content deep in the kept interior counts for nothing — a
-smooth falloff with no arbitrary cutoff width to choose. Treating that
-weighted gradient magnitude as an unnormalised distribution over
-rows/columns, low entropy means the cuts are concentrated in a few of them
-(the boundary mostly runs through flat, featureless regions and only clips
-something in a narrow band) rather than smeared evenly across many
-different rows/columns, i.e. many different objects. Cutting no edges at
-all is the best case and scores as zero entropy.
+be the thing that gets clipped. Each row/column is weighted by a parafoveal
+acuity falloff (`_edge_risk_kernel` — the same model `depth_blur.py`'s
+`--focus auto` uses, run in reverse) that is 0 at the crop's own centre and
+rises smoothly toward 1 at each boundary: a viewer's acuity for content
+near the crop's own centre is highest, so content lost there would be most
+missed, while content out near a boundary is already at the edge of what a
+viewer fixating on the centre could resolve clearly, and losing it costs
+comparatively little. Cortical-magnification eccentricity falloff replaces
+an earlier, purely geometric parabola — same 0-at-centre, rising-to-the-
+boundary shape, but with no arbitrary exponent to have chosen, only
+quantities with an independent, citable meaning (assumed viewing distance,
+half-acuity eccentricity). Treating that weighted gradient magnitude as an
+unnormalised distribution over rows/columns, low entropy means the cuts are
+concentrated in a few of them (the boundary mostly runs through flat,
+featureless regions and only clips something in a narrow band) rather than
+smeared evenly across many different rows/columns, i.e. many different
+objects. Cutting no edges at all is the best case and scores as zero
+entropy.
 
 The offset is chosen from one "edge source", then applied identically to
 every input given — so a matched set of images (e.g. day/night variants of
@@ -68,6 +75,73 @@ def _entropy(profile):
     return float(-(nz * np.log2(nz)).sum()), total
 
 
+def _edge_risk_kernel(new_length, other, viewing_distance_factor=1.5, e2_degrees=2.3):
+    """1-D weight over a crop window's own crop-axis positions, 0 at its
+    centre and rising smoothly toward (but never reaching) 1 at each edge —
+    "how much would losing this position to the cut actually cost."
+
+    This is `depth_blur.py`'s parafoveal acuity model (see
+    `_detect_figure_focus`/`_foveal_weight_map` there) applied in reverse.
+    That model gives a pixel's *acuity* — how sharply a viewer fixating on
+    the image's own centre could resolve it — as
+    `1 / (1 + e/E2)` (Rovamo & Virsu 1979's cortical-magnification
+    falloff), where `e` is its eccentricity in degrees and `E2` the
+    eccentricity at which acuity has halved. Here we want the opposite
+    quantity: not "how well would a viewer see this," but "how much is
+    lost if this position is cut" — the complement, `e / (e + E2)`, which
+    is 0 at zero eccentricity (the crop's own centre, most sharply seen,
+    so losing it would be most noticeable) and rises toward 1 with
+    eccentricity (content already at the edge of clear vision costs little
+    to lose). This directly replaces an earlier, purely geometric parabola
+    of the same 0-at-centre, rising-to-the-boundary shape, but with no
+    arbitrary exponent to have picked — only quantities with an
+    independent, citable meaning.
+
+    Eccentricity comes from the same viewing-geometry assumption used
+    there: a viewer at `viewing_distance_factor` times the final cropped
+    image's own diagonal (computed from `new_length` and `other`, the
+    crop's two final dimensions — physical pixel pitch cancels out of the
+    ratio, so no assumption about actual display size is needed). Distance
+    along the crop axis only (not the perpendicular axis) stands in for
+    eccentricity: the algorithm this feeds only ever varies the offset
+    along one axis, so — exactly as the parabola it replaces already did —
+    only crop-axis position affects risk here.
+    """
+    diag_px = np.hypot(new_length, other)
+    viewing_distance_px = viewing_distance_factor * diag_px
+    half = new_length / 2.0
+    k = np.arange(new_length, dtype=np.float64)
+    eccentricity_px = np.abs(k - half)
+    eccentricity_deg = np.degrees(np.arctan(eccentricity_px / viewing_distance_px))
+    return eccentricity_deg / (eccentricity_deg + e2_degrees)
+
+
+def _correlate_valid(m, kernel):
+    """Batched 'valid'-mode cross-correlation of each row of `m` (R, L)
+    against `kernel` (K,): `out[r, o] = sum_k m[r, o+k] * kernel[k]` for
+    `o` in `[0, L-K]`, i.e. the weighted sum of every length-K window.
+
+    A window's weight kernel has the same shape regardless of where the
+    window sits — only `_edge_risk_kernel`'s output, computed once,
+    shifted by the offset — so this is exactly a sliding dot product, i.e.
+    a correlation, of `m` against that fixed kernel. Computed via FFT
+    (batched across rows in one transform) rather than a direct O(L*K)
+    sliding window, since a direct sum per offset would cost O(excess *
+    new_length * other) here — potentially billions of operations for a
+    large image — versus O(other * L log L) for the FFT route.
+    """
+    length = m.shape[1]
+    k_len = kernel.shape[0]
+    out_len = length - k_len + 1
+    n_fft = 1
+    while n_fft < length + k_len - 1:
+        n_fft *= 2
+    m_f = np.fft.rfft(m, n=n_fft, axis=1)
+    k_f = np.fft.rfft(kernel[::-1], n=n_fft)
+    full = np.fft.irfft(m_f * k_f[None, :], n=n_fft, axis=1)
+    return full[:, k_len - 1:k_len - 1 + out_len]
+
+
 def find_crop_offset(edge_source, ratio_w, ratio_h):
     """Minimum-entropy crop offset for `ratio_w:ratio_h` from `edge_source`
     (a BGR colour image or a single-channel depth map — see `_gradient_magnitude`).
@@ -77,15 +151,11 @@ def find_crop_offset(edge_source, ratio_w, ratio_h):
     depth_blur.py's _crop_to_aspect).
 
     Rather than scoring only the single boundary row/column, every
-    row/column in the kept window contributes, weighted by a parabola
-    `((x - centre) / (new_length/2))**2` (x = absolute position, centre =
-    the crop window's own midpoint): 1 at each boundary, 0 at the centre.
-    Expanding the square, the weighted sum over the window is a
-    combination of three window sums — of the gradient magnitude itself,
-    of position-weighted magnitude, and of position^2-weighted magnitude —
-    each obtainable from a prefix sum along the crop axis in O(1), so
-    scanning every candidate offset stays O(excess x other) despite scoring
-    the entire window rather than a fixed-width margin.
+    row/column in the kept window contributes, weighted by
+    `_edge_risk_kernel` (0 at the crop window's own centre, rising toward
+    1 at each boundary). The weighted sum over the window, for every
+    candidate offset at once, is a single batched correlation
+    (`_correlate_valid`) of the gradient magnitude against that kernel.
 
     Returns (axis, offset, new_length, entropies, totals): axis is 'x' or
     'y'; entropies/totals are per-offset arrays covering the full excess
@@ -102,33 +172,17 @@ def find_crop_offset(edge_source, ratio_w, ratio_h):
         other = w
     new_length = other * other_ratio_num // other_ratio_den
     excess = length - new_length
-    half = new_length / 2.0
 
-    # Work with the crop axis as columns (axis=1) regardless of 'x' or 'y',
-    # so the same prefix-sum logic covers both.
+    # Work with the crop axis as columns (axis=1) regardless of 'x' or 'y'.
     m = mag if axis == 'x' else mag.T
-    xs = np.arange(m.shape[1], dtype=np.float64)
 
-    def prefix(values):
-        return np.concatenate([np.zeros((m.shape[0], 1)), np.cumsum(values, axis=1)], axis=1)
-
-    cum0 = prefix(m)
-    cum1 = prefix(m * xs[None, :])
-    cum2 = prefix(m * xs[None, :] ** 2)
-
-    def window_sum(cum, a, b):
-        return cum[:, b] - cum[:, a]
+    kernel = _edge_risk_kernel(new_length, other)
+    weighted_sums = _correlate_valid(m, kernel)  # (other, excess+1)
 
     entropies = np.zeros(excess + 1)
     totals = np.zeros(excess + 1)
     for o in range(excess + 1):
-        centre = o + half
-        s0 = window_sum(cum0, o, o + new_length)
-        s1 = window_sum(cum1, o, o + new_length)
-        s2 = window_sum(cum2, o, o + new_length)
-        # sum_x mag(x) * ((x - centre) / half)^2, expanded
-        profile = (s2 - 2 * centre * s1 + centre * centre * s0) / (half * half)
-        profile = np.clip(profile, 0, None)  # guard against float rounding
+        profile = np.clip(weighted_sums[:, o], 0, None)  # guard against float rounding
         entropies[o], totals[o] = _entropy(profile)
 
     # Primary key: entropy. Secondary: total edge weight cut (breaks the
