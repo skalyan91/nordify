@@ -41,7 +41,7 @@ python3 depth_blur.py <input> -o <blurred> [options]
 | `--no-crop` | — | Skip aspect-ratio cropping |
 | `--blur PCT` | `2.0` | Max disc radius (circle of confusion) as % of image height |
 | `--levels N` | `16` | Number of depth slabs for scatter compositing |
-| `--focus D\|auto` | `0.0` | Focus plane as normalised disparity: `0.0`=background/infinity, `1.0`=foreground, or `auto` to detect the principal figure via SAM segmentation; see [Methods](#automatic-figure-detection---focus-auto) below |
+| `--focus D\|auto` | `auto` | Focus plane as normalised disparity: `0.0`=background/infinity, `1.0`=foreground, or `auto` to detect the principal figure via SAM segmentation; see [Methods](#automatic-figure-detection---focus-auto) below |
 | `--depth-only` | — | Save the blur-strength map and exit (useful for tuning) |
 | `--save-depth PATH` | — | Also save the normalised depth map alongside the main output |
 | `--save-figure-mask PATH` | — | With `--focus auto`, also save the winning figure region as a mask alongside the main output |

@@ -940,9 +940,9 @@ def main():
                              "the farthest point from the focus plane)")
     parser.add_argument("--levels", type=int, default=16, metavar="N",
                         help="Number of depth slabs for scatter compositing")
-    parser.add_argument("--focus", type=_focus_type, default=0.0, metavar="D",
-                        help="Focus plane as normalised disparity: 0.0=background/infinity "
-                             "(default), 1.0=foreground, or 'auto' to detect the principal "
+    parser.add_argument("--focus", type=_focus_type, default="auto", metavar="D",
+                        help="Focus plane as normalised disparity: 0.0=background/infinity, "
+                             "1.0=foreground, or 'auto' (default) to detect the principal "
                              "figure via SAM segmentation, weighted by a parafoveal acuity "
                              "model (viewer at 1.5x the image diagonal), and focus on its "
                              "median depth")
