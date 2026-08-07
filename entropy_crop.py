@@ -57,12 +57,27 @@ def _gradient_magnitude(image):
     palette-snapped image, where most of the frame is large flat colour
     regions — leaving pathological ties between candidate offsets. Sobel's
     continuous magnitude has no such dead zone.
+
+    Uses `BORDER_REPLICATE` rather than OpenCV's default `BORDER_REFLECT_101`
+    for both the blur and the Sobel derivatives. REFLECT_101 mirrors each
+    axis about the edge pixel itself, so the two samples a derivative at
+    column 0 compares — reflected "column -1" and real "column 1" — are
+    identical, forcing the horizontal derivative to exactly zero at column 0
+    (and the vertical derivative to zero at row 0) regardless of actual
+    content: confirmed on a bright vertical stripe placed in the image's own
+    leftmost column, which reads gx=0 at column 0 under the default border
+    vs. the correct full-strength gradient one column in. Real content that
+    touches the image's own edge — exactly the case that matters for offsets
+    0 and `excess`, where a crop window boundary coincides with the image's
+    true border rather than an internal cut — was being invisible to the
+    risk scoring. BORDER_REPLICATE extends the edge pixel's own value
+    outward instead, giving a real one-sided derivative there.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     gray = gray.astype(np.float32)
-    gray = cv2.GaussianBlur(gray, (0, 0), sigmaX=1.5)
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    gray = cv2.GaussianBlur(gray, (0, 0), sigmaX=1.5, borderType=cv2.BORDER_REPLICATE)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3, borderType=cv2.BORDER_REPLICATE)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3, borderType=cv2.BORDER_REPLICATE)
     return np.sqrt(gx * gx + gy * gy).astype(np.float64)
 
 
