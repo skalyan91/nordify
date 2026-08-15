@@ -663,9 +663,123 @@ def _foveal_weight_map(h, w, viewing_distance_factor=1.5, e2_degrees=2.3):
     return (1.0 / (1.0 + eccentricity_deg / e2_degrees)).astype(np.float32)
 
 
+def _segment_candidates(depth_raw, image_bgr, sam_model="facebook/sam-vit-base",
+                        target_width=1500, min_area_frac=0.0005, max_area_frac=0.5):
+    """SAM automatic mask generation on `image_bgr`, merged by depth-range
+    overlap and split back into connected components — the shared
+    candidate-region-finding core of `_detect_figure_focus` (see its own
+    docstring below for the full rationale this shares: why SAM rather
+    than depth-map edge detection, why merge-then-split, why the two
+    area-fraction cutoffs). Returns a list of boolean `(H, W)` masks, one
+    per surviving candidate, with no depth/foveal scoring applied —
+    `_detect_figure_focus` does that scoring on top of this; `--save-
+    segmentation` instead dumps this same candidate set directly, in the
+    label-map form `palettize.py`'s wallpaper shaders expect as their
+    `u_segmentation` input (see `_segmentation_label_map`).
+    """
+    try:
+        from transformers import pipeline as hf_pipeline
+        import torch
+        from PIL import Image as PILImage
+    except ImportError as e:
+        print(
+            f"Error: {e}\n"
+            "Figure detection requires: pip install transformers torch pillow",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    h, w = depth_raw.shape
+    d_min, d_max = float(depth_raw.min()), float(depth_raw.max())
+    if d_max - d_min < 1e-6:
+        return []
+
+    device = "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu"
+    scale = min(1.0, target_width / w)
+    small = cv2.resize(image_bgr, (max(1, int(w * scale)), max(1, int(h * scale))),
+                       interpolation=cv2.INTER_AREA)
+    rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+
+    print(f"  [focus] figure segmentation: running SAM ({sam_model}) on "
+          f"{small.shape[1]}x{small.shape[0]} downsample...", file=sys.stderr, flush=True)
+    pipe = hf_pipeline("mask-generation", model=sam_model, device=device)
+    out = pipe(PILImage.fromarray(rgb), points_per_batch=64, points_per_side=32)
+
+    total_px = h * w
+
+    # First pass: raw SAM masks, filtered only for size.
+    regions = []
+    for m in out["masks"]:
+        m = np.array(m).astype(np.uint8)
+        if m.sum() == 0:
+            continue
+        mask = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
+        area = int(mask.sum())
+        if area < min_area_frac * total_px:
+            continue
+        d_lo, d_hi = np.percentile(depth_raw[mask], [10, 90])
+        d_hi = max(float(d_hi), float(d_lo) + (d_max - d_min) * 1e-4)
+        regions.append({"mask": mask, "lo": float(d_lo), "hi": d_hi})
+
+    if not regions:
+        return []
+
+    # Merge same-depth regions (transitively, via union-find over the
+    # pairwise >50%-both-ways overlap graph) back into single figures.
+    uf = _UnionFind(len(regions))
+    for i in range(len(regions)):
+        for j in range(i + 1, len(regions)):
+            if _ranges_overlap_50(regions[i]["lo"], regions[i]["hi"],
+                                  regions[j]["lo"], regions[j]["hi"]):
+                uf.union(i, j)
+
+    groups = {}
+    for i in range(len(regions)):
+        groups.setdefault(uf.find(i), []).append(i)
+
+    masks = []
+    for idxs in groups.values():
+        merged_mask = np.zeros((h, w), dtype=bool)
+        for i in idxs:
+            merged_mask |= regions[i]["mask"]
+
+        # Split back into connected components -- see _detect_figure_focus's
+        # docstring for why (a depth-range merge alone says nothing about
+        # spatial contiguity).
+        mask_u8 = merged_mask.astype(np.uint8)
+        n_cc, cc_labels, cc_stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+        for label in range(1, n_cc):
+            area = int(cc_stats[label, cv2.CC_STAT_AREA])
+            if area < min_area_frac * total_px or area > max_area_frac * total_px:
+                continue
+            masks.append(cc_labels == label)
+
+    return masks
+
+
+def _segmentation_label_map(masks, shape, max_segments=63):
+    """Combines `_segment_candidates`' output into the single-channel
+    label image palettize.py's wallpaper shaders expect as `u_segmentation`:
+    0 = background/unassigned, 1..N = one candidate region each (see
+    shaders/wallpaper/README.md's contract; N is capped at `max_segments`
+    to fit the shader's own `MAX_SEGMENTS=64` slot 0 being reserved for
+    background). Masks are non-overlapping by construction (each comes
+    from a distinct connected-component label); if there are more than
+    `max_segments` candidates, only the largest survive -- a scene with
+    that many distinct SAM regions almost certainly has plenty of small,
+    unimportant ones to spare.
+    """
+    if len(masks) > max_segments:
+        masks = sorted(masks, key=lambda m: -int(m.sum()))[:max_segments]
+    label_map = np.zeros(shape, dtype=np.uint8)
+    for i, mask in enumerate(masks, start=1):
+        label_map[mask] = i
+    return label_map
+
+
 def _detect_figure_focus(depth_raw, image_bgr, sam_model="facebook/sam-vit-base",
                          target_width=1500, min_area_frac=0.0005, max_area_frac=0.5,
-                         viewing_distance_factor=1.5, e2_degrees=2.3):
+                         viewing_distance_factor=1.5, e2_degrees=2.3, masks=None):
     """Locate the principal "figure" — the segmented region with the
     greatest *parafoveally- and depth-weighted* extent — and return its
     median depth, normalised the same way `_depth_blur` normalises
@@ -767,76 +881,23 @@ def _detect_figure_focus(depth_raw, image_bgr, sam_model="facebook/sam-vit-base"
 
     Falls back to 0.0 (background/infinity focus, this module's existing
     default) if segmentation finds no surviving candidate at all.
-    """
-    try:
-        from transformers import pipeline as hf_pipeline
-        import torch
-        from PIL import Image as PILImage
-    except ImportError as e:
-        print(
-            f"Error: {e}\n"
-            "Figure detection requires: pip install transformers torch pillow",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
+    `masks`: pass `_segment_candidates`'s own output directly to reuse an
+    already-computed candidate set (e.g. when `--save-segmentation` has
+    already run SAM this invocation) instead of running SAM again.
+    """
     h, w = depth_raw.shape
     d_min, d_max = float(depth_raw.min()), float(depth_raw.max())
     if d_max - d_min < 1e-6:
         return 0.0, None
 
-    device = "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu"
-    scale = min(1.0, target_width / w)
-    small = cv2.resize(image_bgr, (max(1, int(w * scale)), max(1, int(h * scale))),
-                       interpolation=cv2.INTER_AREA)
-    rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-
-    print(f"  [focus] figure segmentation: running SAM ({sam_model}) on "
-          f"{small.shape[1]}x{small.shape[0]} downsample...", file=sys.stderr, flush=True)
-    pipe = hf_pipeline("mask-generation", model=sam_model, device=device)
-    out = pipe(PILImage.fromarray(rgb), points_per_batch=64, points_per_side=32)
-
-    total_px = h * w
-
-    # First pass: raw SAM masks, filtered only for size.
-    regions = []
-    for m in out["masks"]:
-        m = np.array(m).astype(np.uint8)
-        if m.sum() == 0:
-            continue
-        mask = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
-        area = int(mask.sum())
-        if area < min_area_frac * total_px:
-            continue
-        d_lo, d_hi = np.percentile(depth_raw[mask], [10, 90])
-        # A region of near-uniform depth (common — flat surfaces, solid-
-        # colour painted objects) has a near-zero-width percentile range.
-        # Left unpadded, comparing two such regions gives an `inter` of
-        # exactly 0 even when their ranges are identical, so they'd never
-        # be judged to overlap. Pad every range's width by a small fraction
-        # of the whole map's spread so equal (or near-equal) flat regions
-        # register as fully overlapping instead of falling through the
-        # inter<=0 no-overlap guard.
-        d_hi = max(float(d_hi), float(d_lo) + (d_max - d_min) * 1e-4)
-        regions.append({"mask": mask, "lo": float(d_lo), "hi": d_hi})
-
-    if not regions:
+    if masks is None:
+        masks = _segment_candidates(depth_raw, image_bgr, sam_model,
+                                    target_width, min_area_frac, max_area_frac)
+    if not masks:
         print("  [focus] no figure candidate found; falling back to d_focus=0.0",
               file=sys.stderr, flush=True)
         return 0.0, None
-
-    # Merge same-depth regions (transitively, via union-find over the
-    # pairwise >50%-both-ways overlap graph) back into single figures.
-    uf = _UnionFind(len(regions))
-    for i in range(len(regions)):
-        for j in range(i + 1, len(regions)):
-            if _ranges_overlap_50(regions[i]["lo"], regions[i]["hi"],
-                                  regions[j]["lo"], regions[j]["hi"]):
-                uf.union(i, j)
-
-    groups = {}
-    for i in range(len(regions)):
-        groups.setdefault(uf.find(i), []).append(i)
 
     # Combine spatial (foveal) and depth weighting into one per-pixel map,
     # rather than scoring them as separate criteria: nearness is folded in
@@ -852,41 +913,12 @@ def _detect_figure_focus(depth_raw, image_bgr, sam_model="facebook/sam-vit-base"
     depth_weight = (depth_raw - d_min) / (d_max - d_min)
     combined_weight = foveal_weight * depth_weight
 
-    candidates = []
-    for idxs in groups.values():
-        merged_mask = np.zeros((h, w), dtype=bool)
-        for i in idxs:
-            merged_mask |= regions[i]["mask"]
-
-        # A depth-range merge can glue together spatially disjoint pieces
-        # that only coincidentally share a depth range — several separate
-        # leaf clusters scattered through a tree canopy, all at a similar
-        # distance, for instance — since matching depth alone says nothing
-        # about whether the result is actually one contiguous object.
-        # Splitting back into connected components is the structural fix:
-        # every candidate that reaches scoring is, by construction, one
-        # spatially contiguous piece. This isn't a scored shape preference
-        # the way the old connectedness criterion was — just the baseline
-        # requirement that a candidate actually be *a* region, not a
-        # scattered union of several.
-        mask_u8 = merged_mask.astype(np.uint8)
-        n_cc, cc_labels, cc_stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
-        for label in range(1, n_cc):
-            area = int(cc_stats[label, cv2.CC_STAT_AREA])
-            if area < min_area_frac * total_px or area > max_area_frac * total_px:
-                continue
-            piece_mask = cc_labels == label
-            candidates.append({
-                "area": area,
-                "weighted_mass": float(combined_weight[piece_mask].sum()),
-                "median_depth": float(np.median(depth_raw[piece_mask])),
-                "mask": piece_mask,
-            })
-
-    if not candidates:
-        print("  [focus] no figure candidate found; falling back to d_focus=0.0",
-              file=sys.stderr, flush=True)
-        return 0.0, None
+    candidates = [{
+        "area": int(mask.sum()),
+        "weighted_mass": float(combined_weight[mask].sum()),
+        "median_depth": float(np.median(depth_raw[mask])),
+        "mask": mask,
+    } for mask in masks]
 
     best = max(candidates, key=lambda c: c["weighted_mass"])
 
@@ -949,6 +981,13 @@ def main():
     parser.add_argument("--save-figure-mask", metavar="PATH",
                         help="With --focus auto, also save the winning figure region as a "
                              "greyscale mask (white=figure) alongside the main output")
+    parser.add_argument("--save-segmentation", metavar="PATH",
+                        help="Also save the full SAM candidate-region segmentation (before "
+                             "figure scoring) as a greyscale label map -- pixel value = region "
+                             "ID, 0 = background -- matching palettize.py's wallpaper shaders' "
+                             "u_segmentation contract (see shaders/wallpaper/README.md). Runs "
+                             "the same SAM segmentation --focus auto uses, reused rather than "
+                             "re-run if both are requested together.")
 
     args = parser.parse_args()
 
@@ -975,8 +1014,21 @@ def main():
         cv2.imwrite(args.save_depth, np.clip(depth_norm * 255, 0, 255).astype(np.uint8))
         print(f"Saved depth map '{args.save_depth}'")
 
+    # Both --focus auto and --save-segmentation need the same SAM
+    # candidate-region set; compute it once and share it rather than
+    # running SAM twice when both are requested.
+    seg_masks = None
+    if args.focus == "auto" or args.save_segmentation:
+        seg_masks = _segment_candidates(depth_raw, image)
+
+    if args.save_segmentation:
+        label_map = _segmentation_label_map(seg_masks, depth_raw.shape)
+        cv2.imwrite(args.save_segmentation, label_map)
+        print(f"Saved segmentation map '{args.save_segmentation}' "
+              f"({int(label_map.max())} candidate region(s))")
+
     if args.focus == "auto":
-        d_focus, figure_mask = _detect_figure_focus(depth_raw, image)
+        d_focus, figure_mask = _detect_figure_focus(depth_raw, image, masks=seg_masks)
     else:
         d_focus, figure_mask = args.focus, None
 

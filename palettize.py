@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
-"""Convert an image to the Nord colour palette via Oklab snapping."""
+"""Convert an image to a fixed colour palette (Nord, Solarized, Gruvbox,
+Everforest, Catppuccin, Dracula, ...) via Oklab snapping. See PALETTES
+below for the full list; pass --palette to pick one."""
 
 import argparse
 import sys
 
-import cv2
 import numpy as np
+
+# cv2 (opencv-python) is imported lazily, inside the handful of functions
+# that actually use it (mix_convert_spectral's/​_dog_light_peaks' blur
+# steps, main()'s image I/O) -- not at module level. Every palette/colour-
+# geometry function (PALETTES, _palette_bgr, _halfspace_eqs,
+# _face_geometry, _fit_palette_ks, build_lookup, convert, ...) is plain
+# numpy with no cv2 dependency at all, so this module stays importable
+# under Pyodide (which has no opencv-python build) as long as callers
+# only exercise that geometry-only surface -- exactly what the web demo's
+# client-side palette-geometry computation needs (see
+# shaders/wallpaper/web/palette_geometry.js).
 
 KM_EPS  = 1e-3   # minimum reflectance before K/S conversion; K/S(KM_EPS) ≈ 499
 
@@ -69,25 +81,88 @@ def _oklab_to_bgr(lab):
     ], axis=-1)
 
 
-PALETTE_BGR = [
-    (  0,   0,   0),  # black   #000000  (extended — full lightness range)
-    ( 64,  52,  46),  # nord0   #2E3440  Polar Night
-    ( 82,  66,  59),  # nord1   #3B4252  Polar Night
-    ( 94,  76,  67),  # nord2   #434C5E  Polar Night
-    (106,  86,  76),  # nord3   #4C566A  Polar Night
-    (233, 222, 216),  # nord4   #D8DEE9  Snow Storm
-    (240, 233, 229),  # nord5   #E5E9F0  Snow Storm
-    (244, 239, 236),  # nord6   #ECEFF4  Snow Storm
-    (187, 188, 143),  # nord7   #8FBCBB  Frost
-    (208, 192, 136),  # nord8   #88C0D0  Frost
-    (193, 161, 129),  # nord9   #81A1C1  Frost
-    (172, 129,  94),  # nord10  #5E81AC  Frost
-    (106,  97, 191),  # nord11  #BF616A  Aurora
-    (112, 135, 208),  # nord12  #D08770  Aurora
-    (139, 203, 235),  # nord13  #EBCB8B  Aurora
-    (140, 190, 163),  # nord14  #A3BE8C  Aurora
-    (173, 142, 180),  # nord15  #B48EAD  Aurora
-]
+# Every named palette is a list of (B, G, R) uint8 triples with a pure
+# black (0, 0, 0) prepended -- "extended, full lightness range", the same
+# convention the original Nord-only palette used, kept here for every
+# scheme rather than just Nord: mixing (mix_convert_spectral/additive)
+# and colour snapping alike benefit from a true-black anchor regardless
+# of how dark a scheme's own darkest background tone is.
+PALETTES = {
+    # #2E3440 #3B4252 #434C5E #4C566A / #D8DEE9 #E5E9F0 #ECEFF4 /
+    # #8FBCBB #88C0D0 #81A1C1 #5E81AC / #BF616A #D08770 #EBCB8B #A3BE8C #B48EAD
+    'nord': [
+        (0, 0, 0),
+        (64, 52, 46), (82, 66, 59), (94, 76, 67), (106, 86, 76),
+        (233, 222, 216), (240, 233, 229), (244, 239, 236),
+        (187, 188, 143), (208, 192, 136), (193, 161, 129), (172, 129, 94),
+        (106, 97, 191), (112, 135, 208), (139, 203, 235), (140, 190, 163), (173, 142, 180),
+    ],
+    # base03..base3 #002B36 #073642 #586E75 #657B83 #839496 #93A1A1 #EEE8D5 #FDF6E3 /
+    # yellow orange red magenta violet blue cyan green
+    # #B58900 #CB4B16 #DC322F #D33682 #6C71C4 #268BD2 #2AA198 #859900
+    'solarized-dark': [
+        (0, 0, 0),
+        (54, 43, 0), (66, 54, 7), (117, 110, 88), (131, 123, 101),
+        (150, 148, 131), (161, 161, 147), (213, 232, 238), (227, 246, 253),
+        (0, 137, 181), (22, 75, 203), (47, 50, 220), (130, 54, 211),
+        (196, 113, 108), (210, 139, 38), (152, 161, 42), (0, 153, 133),
+    ],
+    # bg0..bg4 #282828 #3C3836 #504945 #665C54 #7C6F64 / fg0..fg3 #FBF1C7 #EBDBB2 #D5C4A1 #BDAE93 /
+    # bright red/green/yellow/blue/purple/aqua/orange
+    # #FB4934 #B8BB26 #FABD2F #83A598 #D3869B #8EC07C #FE8019
+    'gruvbox-dark': [
+        (0, 0, 0),
+        (40, 40, 40), (54, 56, 60), (69, 73, 80), (84, 92, 102), (100, 111, 124),
+        (199, 241, 251), (178, 219, 235), (161, 196, 213), (147, 174, 189),
+        (52, 73, 251), (38, 187, 184), (47, 189, 250), (152, 165, 131),
+        (155, 134, 211), (124, 192, 142), (25, 128, 254),
+    ],
+    # bg0..bg4 #2D353B #343F44 #3D484D #475258 #4F585E / fg #D3C6AA /
+    # red orange yellow green aqua blue purple #E67E80 #E69875 #DBBC7F #A7C080 #83C092 #7FBBB3 #D699B6 /
+    # grey0..grey2 #7A8478 #859289 #9DA9A0
+    'everforest-dark': [
+        (0, 0, 0),
+        (59, 53, 45), (68, 63, 52), (77, 72, 61), (88, 82, 71), (94, 88, 79),
+        (170, 198, 211),
+        (128, 126, 230), (117, 152, 230), (127, 188, 219), (128, 192, 167),
+        (146, 192, 131), (179, 187, 127), (182, 153, 214),
+        (120, 132, 122), (137, 146, 133), (160, 169, 157),
+    ],
+    # base/mantle/crust #1E1E2E #181825 #11111B / text #CDD6F4 / rosewater flamingo pink mauve
+    # red maroon peach yellow green teal sky blue
+    # #F5E0DC #F2CDCD #F5C2E7 #CBA6F7 #F38BA8 #EBA0AC #FAB387 #F9E2AF #A6E3A1 #94E2D5 #89DCEB #89B4FA
+    'catppuccin-mocha': [
+        (0, 0, 0),
+        (46, 30, 30), (37, 24, 24), (27, 17, 17), (244, 214, 205),
+        (220, 224, 245), (205, 205, 242), (231, 194, 245), (247, 166, 203),
+        (168, 139, 243), (172, 160, 235), (135, 179, 250), (175, 226, 249),
+        (161, 227, 166), (213, 226, 148), (235, 220, 137), (250, 180, 137),
+    ],
+    # background current-line foreground comment #282A36 #44475A #F8F8F2 #6272A4 /
+    # cyan green orange pink purple red yellow
+    # #8BE9FD #50FA7B #FFB86C #FF79C6 #BD93F9 #FF5555 #F1FA8C
+    'dracula': [
+        (0, 0, 0),
+        (54, 42, 40), (90, 71, 68), (242, 248, 248), (164, 114, 98),
+        (253, 233, 139), (123, 250, 80), (108, 184, 255), (198, 121, 255),
+        (249, 147, 189), (85, 85, 255), (140, 250, 241),
+    ],
+}
+DEFAULT_PALETTE = 'nord'
+
+
+def _palette_bgr(name=None):
+    """Returns the (B, G, R) list for a named palette (default:
+    DEFAULT_PALETTE). Every conversion/mixing entry point below accepts a
+    `palette_name` and resolves it through this function, so an unknown
+    name fails with a clear message rather than a bare KeyError."""
+    name = name or DEFAULT_PALETTE
+    try:
+        return PALETTES[name]
+    except KeyError:
+        raise ValueError(
+            f"Unknown palette '{name}'. Available: {', '.join(sorted(PALETTES))}"
+        ) from None
 
 # ── CIE 1931 2° standard observer and D65 illuminant (400–700 nm, 10 nm) ────
 _LAMBDA = np.arange(400, 710, 10, dtype=np.float32)  # (31,)
@@ -149,10 +224,22 @@ _M_XYZ_TO_RGB = np.array([
     [ 0.0556434, -0.2040259,  1.0572252],
 ], dtype=np.float32)
 
-_PALETTE_KS: np.ndarray | None = None  # (N_palette, 31) K/S spectra, fitted on first use
+_M_RGB_TO_LMS = np.array([
+    [0.4122214708, 0.5363325363, 0.0514459929],
+    [0.2119034982, 0.6806995451, 0.1073969566],
+    [0.0883024619, 0.2817188376, 0.6299787005],
+], dtype=np.float64)
+
+_M_LMS_TO_OKLAB = np.array([
+    [ 0.2104542553,  0.7936177850, -0.0040720468],
+    [ 1.9779984951, -2.4285922050,  0.4505937099],
+    [ 0.0259040371,  0.4072165126, -0.4331205297],
+], dtype=np.float64)
+
+_PALETTE_KS_CACHE: dict = {}  # palette_name -> (N_palette, 31) K/S spectra, fitted on first use per palette
 
 
-def _fit_palette_ks():
+def _fit_palette_ks(palette_bgr=None):
     """Fit a reflectance model to each palette colour.
 
     Spectral colours use a single Gaussian:
@@ -163,8 +250,11 @@ def _fit_palette_ks():
     A single Gaussian cannot simultaneously stimulate the L and S cones while
     leaving the M cone depressed; the bi-Gaussian is the physically correct model.
 
+    palette_bgr: (B, G, R) triples to fit; defaults to _palette_bgr() (Nord).
+
     Returns (N_palette, 31) float32 K/S ratios.
     """
+    palette_bgr = palette_bgr if palette_bgr is not None else _palette_bgr()
     lam    = _LAMBDA.astype(np.float64)
     k_norm = float((_D65 * _CIE_CMF[:, 1]).sum())
     D65n   = _D65.astype(np.float64) / k_norm       # normalised so Y(white) = 1
@@ -179,9 +269,9 @@ def _fit_palette_ks():
     except ImportError:
         _have_scipy = False
 
-    pal_ks = np.zeros((len(PALETTE_BGR), 31), dtype=np.float32)
+    pal_ks = np.zeros((len(palette_bgr), 31), dtype=np.float32)
 
-    for i, (b8, g8, r8) in enumerate(PALETTE_BGR):
+    for i, (b8, g8, r8) in enumerate(palette_bgr):
         r_lin = float(_srgb_to_linear(r8 / 255.0))
         g_lin = float(_srgb_to_linear(g8 / 255.0))
         b_lin = float(_srgb_to_linear(b8 / 255.0))
@@ -264,10 +354,12 @@ def _fit_palette_ks():
     return pal_ks
 
 
-def build_lookup():
-    """Pre-compute Oklab (L, a, b) and Oklch hue H for each palette colour."""
-    bgr = np.array(PALETTE_BGR, dtype=np.float32) / 255.0
-    lab = _bgr_to_oklab(bgr)  # (16, 3)
+def build_lookup(palette_bgr=None):
+    """Pre-compute Oklab (L, a, b) and Oklch hue H for each palette colour.
+    palette_bgr: defaults to _palette_bgr() (Nord)."""
+    palette_bgr = palette_bgr if palette_bgr is not None else _palette_bgr()
+    bgr = np.array(palette_bgr, dtype=np.float32) / 255.0
+    lab = _bgr_to_oklab(bgr)  # (N_palette, 3)
     palette = []
     for row in lab:
         L, a, b = float(row[0]), float(row[1]), float(row[2])
@@ -390,17 +482,34 @@ def _simplex_project_mlx(c):
     return mx.maximum(c - theta, 0.0)
 
 
-def _halfspace_eqs(points):
-    """Half-space representation of the convex hull of 'points' (N, 3).
+def _simplex_clip_ab(a, b):
+    """Clamp barycentric coordinates (a, b, 1-a-b) — any shape — onto the
+    standard 2-simplex, by reusing _simplex_project_mlx on the triple."""
+    import mlx.core as mx
+    shape = a.shape
+    tri = mx.stack([a, b, 1.0 - a - b], axis=-1).reshape(-1, 3)
+    tri = _simplex_project_mlx(tri).reshape(*shape, 3)
+    return tri[..., 0], tri[..., 1]
 
-    Each row [nx, ny, nz, d] of the returned (F, 4) array satisfies
-    nx*x + ny*y + nz*z + d <= 0 for all x inside the hull.
-    O(N^4) — fine for small N (N = 18 palette entries).
+
+def _halfspace_eqs(points):
+    """Half-space representation of the convex hull of 'points' (N, 3),
+    plus the vertex-index triple of each valid face.
+
+    Each row [nx, ny, nz, d] of the returned (F, 4) `eqs` array satisfies
+    nx*x + ny*y + nz*z + d <= 0 for all x inside the hull. `tris` (F, 3)
+    int gives each face's vertex indices into `points` — for a facet
+    with more than 3 coplanar hull vertices, every valid triple of its
+    vertices is emitted as its own (overlapping) triangle; their union
+    still covers the whole facet, since any triangulation from a fixed
+    vertex is itself a subset of "all triples".
+    O(N^4) — fine for small N (N = 19 palette + black + white).
     """
     pts = np.asarray(points, dtype=np.float64)
     N   = len(pts)
     centroid = pts.mean(axis=0)
-    eqs = []
+    eqs  = []
+    tris = []
     for i in range(N):
         for j in range(i + 1, N):
             for k in range(j + 1, N):
@@ -412,20 +521,27 @@ def _halfspace_eqs(points):
                     continue
                 n /= nrm
                 d = float(-n @ pts[i])
+                # Orient normal outward from centroid *before* validating —
+                # the raw cross product's handedness depends only on the
+                # arbitrary i<j<k ordering, so checking validity first would
+                # reject a genuine facet whenever that ordering happens to
+                # point the normal inward instead of outward.
+                if float(n @ centroid) + d > 0:
+                    n, d = -n, -d
                 # Valid face: every point is on the non-positive side
                 if not np.all(pts @ n + d <= 1e-8):
                     continue
-                # Orient normal outward from centroid
-                if float(n @ centroid) + d > 0:
-                    n, d = -n, -d
                 eqs.append(np.append(n, d).astype(np.float32))
-    return np.array(eqs, dtype=np.float32) if eqs else np.zeros((0, 4), dtype=np.float32)
+                tris.append((i, j, k))
+    eqs_arr  = np.array(eqs, dtype=np.float32) if eqs else np.zeros((0, 4), dtype=np.float32)
+    tris_arr = np.array(tris, dtype=np.int64) if tris else np.zeros((0, 3), dtype=np.int64)
+    return eqs_arr, tris_arr
 
 
 def _mix_strip_spectral(strip_bgr, palette_ks_mx, D65n_cmf_mx, M_xyz2rgb_mx,
                         c_anchor=None, reg_lambda=0.05,
                         max_iters=500, tol=1e-5, optimizer='adam', adam_lr=0.02,
-                        lr_final_frac=0.05, progress_label=None):
+                        lr_final_frac=0.05, progress_label=None, palette_bgr=None):
     """KM spectral mixing on a flat (M, 3) BGR sRGB strip.
 
     Optimises simplex weights c over palette K/S spectra so that the mixed
@@ -465,7 +581,7 @@ def _mix_strip_spectral(strip_bgr, palette_ks_mx, D65n_cmf_mx, M_xyz2rgb_mx,
         c = mx.array(c_anchor.astype(np.float32))
         anchor_mx = mx.array(c_anchor.astype(np.float32))
     else:
-        pal_bgr_f = np.array(PALETTE_BGR, dtype=np.float32) / 255.0
+        pal_bgr_f = np.array(palette_bgr if palette_bgr is not None else _palette_bgr(), dtype=np.float32) / 255.0
         pal_lin = np.stack([
             _srgb_to_linear(pal_bgr_f[:, 2]),
             _srgb_to_linear(pal_bgr_f[:, 1]),
@@ -576,7 +692,7 @@ def _recon_from_weights(weights, palette_ks, D65n_cmf):
     ], axis=-1).astype(np.float32)
 
 
-def mix_convert_spectral(image, strip_h=256,
+def mix_convert_spectral(image, palette_name=None, strip_h=256,
                          init_sigma=14.0, n_phases=1,
                          steps_per_phase=200, phase_sigma=20.0,
                          phase_shrink=0.0, final_lr=0.01):
@@ -585,6 +701,10 @@ def mix_convert_spectral(image, strip_h=256,
     Fits a Gaussian reflectance spectrum to each palette colour, then for every
     pixel optimises a simplex (Σcᵢ = 1) over palette K/S spectra to minimise
     Oklab distance to the target.
+
+    palette_name: key into PALETTES (default DEFAULT_PALETTE/Nord). The
+    fitted K/S spectra are cached per palette name (_PALETTE_KS_CACHE),
+    so switching palettes across calls never reuses a stale fit.
 
     Pipeline:
       1. Build augmented palette: original N colours + all N*(N-1)/2 pairwise
@@ -601,32 +721,36 @@ def mix_convert_spectral(image, strip_h=256,
               phase limits divergence between adjacent blurred-region pixels.
            b. Between phases (skipped after last): blur σ=phase_sigma + snap.
     """
+    import cv2
     try:
         import mlx.core as mx
     except ImportError:
         print("Error: --mix spectral requires MLX (pip install mlx)", file=sys.stderr)
         sys.exit(1)
 
-    global _PALETTE_KS
-    if _PALETTE_KS is None:
-        print("  Fitting spectral K/S for palette...", file=sys.stderr, flush=True)
-        _PALETTE_KS = _fit_palette_ks()
+    palette_name = palette_name or DEFAULT_PALETTE
+    pal_bgr = _palette_bgr(palette_name)
+
+    if palette_name not in _PALETTE_KS_CACHE:
+        print(f"  Fitting spectral K/S for palette '{palette_name}'...", file=sys.stderr, flush=True)
+        _PALETTE_KS_CACHE[palette_name] = _fit_palette_ks(pal_bgr)
+    palette_ks = _PALETTE_KS_CACHE[palette_name]
 
     k_norm   = float((_D65 * _CIE_CMF[:, 1]).sum())
     D65n_cmf = (_D65[:, None] / k_norm * _CIE_CMF).astype(np.float32)  # (31, 3)
 
-    pal_ks_mx    = mx.array(_PALETTE_KS)
+    pal_ks_mx    = mx.array(palette_ks)
     D65n_cmf_mx  = mx.array(D65n_cmf)
     M_xyz2rgb_mx = mx.array(_M_XYZ_TO_RGB)
 
     img_f = image.astype(np.float32) / 255.0
     rows, cols = img_f.shape[:2]
-    N_pal = _PALETTE_KS.shape[0]
+    N_pal = palette_ks.shape[0]
 
     # ── Build augmented palette: pure colours + pairwise 50/50 K/S mixtures ──
     print("  [mix] building augmented palette + init...", file=sys.stderr, flush=True)
     img_ok = _bgr_to_oklab(img_f)                                    # (H, W, 3)
-    pal_bgr_f = np.array(PALETTE_BGR, dtype=np.float32) / 255.0
+    pal_bgr_f = np.array(pal_bgr, dtype=np.float32) / 255.0
     pal_lin = np.stack([
         _srgb_to_linear(pal_bgr_f[:, 2]),
         _srgb_to_linear(pal_bgr_f[:, 1]),
@@ -638,7 +762,7 @@ def mix_convert_spectral(image, strip_h=256,
 
     # Pairwise 50/50 K/S mixtures
     pi, pj = np.triu_indices(N_pal, k=1)                             # (N_pairs,) each
-    ks_pairs  = 0.5 * (_PALETTE_KS[pi] + _PALETTE_KS[pj])           # (N_pairs, 31)
+    ks_pairs  = 0.5 * (palette_ks[pi] + palette_ks[pj])             # (N_pairs, 31)
     R_pairs   = _km_to_lin(ks_pairs)                                 # (N_pairs, 31)
     XYZ_pairs = R_pairs @ D65n_cmf                                   # (N_pairs, 3)
     rgb_pairs = np.clip(XYZ_pairs @ _M_XYZ_TO_RGB.T, 0.0, 1.0)     # (N_pairs, 3)
@@ -696,7 +820,8 @@ def mix_convert_spectral(image, strip_h=256,
                                     reg_lambda=0.0,
                                     max_iters=steps_per_phase, tol=0.0,
                                     adam_lr=lr,
-                                    progress_label=f"strip {si + 1}/{n_strips}")
+                                    progress_label=f"strip {si + 1}/{n_strips}",
+                                    palette_bgr=pal_bgr)
             weights_hw[r0:r1] = w.reshape(h, cols, N_pal)
         if phase < n_phases - 1:
             for k in range(N_pal):
@@ -707,26 +832,139 @@ def mix_convert_spectral(image, strip_h=256,
             weights_hw = (1.0 - phase_shrink) * weights_hw + phase_shrink / N_pal
 
     flat = _simplex_project_np(weights_hw.reshape(-1, N_pal))
-    bgr  = _recon_from_weights(flat, _PALETTE_KS, D65n_cmf)
+    bgr  = _recon_from_weights(flat, palette_ks, D65n_cmf)
     return np.clip(bgr.reshape(rows, cols, 3) * 255.0, 0, 255).astype(np.uint8)
 
 
-def _mix_strip_additive(strip_lin, hull_eqs, max_iters=300, lr=0.02, tol=1e-6,
-                        progress_label=None):
-    """Projected gradient descent in linear RGB, minimising Oklab distance to target.
+def _face_geometry(pal_ext, hull_tris):
+    """Precompute, once per palette, the per-facet constants needed by
+    _face_newton_closest: each hull triangle's linear-RGB vertex/edge
+    vectors (V0, U, Wv) and their images in LMS space (L0, P, Q) under
+    the fixed RGB→LMS matrix. Returns a dict of float32 (F, 3) arrays."""
+    V0 = pal_ext[hull_tris[:, 0]].astype(np.float64)             # (F, 3) linear RGB
+    U  = pal_ext[hull_tris[:, 1]].astype(np.float64) - V0
+    Wv = pal_ext[hull_tris[:, 2]].astype(np.float64) - V0
 
-    Pixels are first projected onto the palette's convex hull in linear RGB
-    (a no-op for pixels already inside it — only out-of-hull pixels are
-    processed). Optimisation then proceeds in two sequential phases —
-    luminance, then chrominance (a, b jointly) — each running up to
-    max_iters steps. Every step computes the analytic gradient of that
-    phase's loss, proposes color - lr*grad, then projects that candidate
-    back onto the hull via the half-space representation — so the
-    effective, gamut-clamped step is (projected_candidate - color) rather
-    than the raw gradient step.
+    L0 = V0 @ _M_RGB_TO_LMS.T                                    # (F, 3) LMS
+    P  = U  @ _M_RGB_TO_LMS.T
+    Q  = Wv @ _M_RGB_TO_LMS.T
+
+    return {
+        'V0': V0.astype(np.float32), 'U':  U.astype(np.float32), 'Wv': Wv.astype(np.float32),
+        'L0': L0.astype(np.float32), 'P':  P.astype(np.float32), 'Q':  Q.astype(np.float32),
+    }
+
+
+def _face_newton_closest(target_lin, target_ok, geom_mx, n_iters=10,
+                         eps_l=1e-6, lm_lambda=1.0):
+    """Oklab-nearest point on the palette's linear-RGB convex-hull surface,
+    via Levenberg-Marquardt-damped Gauss-Newton on each facet's own (a, b)
+    parametrisation instead of gradient descent over the whole hull.
+
+    For a hull triangle with vertices V0, V0+U, V0+Wv, a point on it is
+    c(a,b) = V0 + a*U + b*Wv (linear RGB). Its LMS coordinates are affine
+    in (a, b) — l(a,b) = L0 + a*P + b*Q — so its Oklab position
+      X(a,b) = B @ cbrt(l(a,b))
+    is a smooth curved surface (the cube root warps the flat triangle; B,
+    the fixed LMS'→Oklab matrix, then shears it). The closest-point
+    condition — the residual X(a,b) - target orthogonal to the surface's
+    tangent plane — is transcendental in (a, b) (no closed form via
+    radicals), but each Gauss-Newton step *is* closed form: build the
+    2x2 Gram matrix of the tangent vectors X_a, X_b (the surface's first
+    fundamental form E, F, G) and solve the 2x2 normal equations via the
+    explicit matrix inverse.
+
+    Near a facet's own corners the two tangent vectors X_a, X_b can become
+    nearly parallel (E, F, G all close together — confirmed on this
+    palette: the very first triangle tested this way, evaluated at one of
+    its own vertices, has cos(angle(X_a, X_b)) ≈ 0.986), making the raw
+    2x2 system ill-conditioned: the un-damped solve produced steps over
+    1000x too large, in the *wrong* direction, and got stuck exactly on
+    that corner for every iteration after. A scalar fudge added to the
+    determinant alone doesn't fix this — it shrinks the step but leaves
+    it built from the same ill-conditioned cofactors, so it can still
+    point the wrong way. Levenberg-Marquardt damping scales the diagonal
+    instead — E → E(1+λ), G → G(1+λ) — which is the standard fix for
+    exactly this failure mode: as λ grows the system decouples toward
+    (Δa, Δb) ≈ (-g_a/(Eλ), -g_b/(Eλ)), i.e. plain gradient descent in
+    that limit, always a descent direction regardless of conditioning.
+    A fixed λ=1 (no annealing schedule — tried, and starting large then
+    decaying let the very first, tiny, badly-conditioned steps get
+    clamped back onto the same corner before λ had decayed enough to
+    move at all) converges to within 1e-4 of a fine per-pixel gradient
+    descent's result on every palette colour tested. (a, b) are re-clamped to the
+    facet's barycentric simplex after every step (reusing
+    _simplex_project_mlx, exactly as the old half-space projector
+    clamped every gradient step onto the hull), so the search never
+    leaves the triangle — this also handles points whose true nearest
+    facet-location is on an edge or vertex, without separate edge/vertex
+    cases. The best result across all facets (24 for this palette) is
+    picked per pixel by final Oklab distance.
+
+    target_lin : (M, 3) MLX array — pixel linear RGB, used only to seed
+                 the initial (a, b) guess.
+    target_ok  : (M, 3) MLX array — pixel Oklab, the actual objective.
+    geom_mx    : dict of (F, 3)/(3, 3) MLX arrays from _face_geometry
+                 (converted to MLX) plus 'B', the LMS'→Oklab matrix.
+    Returns    : (M, 3) MLX array — nearest linear-RGB point on the hull.
+    """
+    import mlx.core as mx
+
+    V0, U, Wv = geom_mx['V0'], geom_mx['U'], geom_mx['Wv']
+    L0, P, Q  = geom_mx['L0'], geom_mx['P'], geom_mx['Q']
+    Bm        = geom_mx['B']                                     # (3, 3)
+    Fc        = V0.shape[0]
+
+    # Flat initial guess: least-squares (a, b) in linear RGB, ignoring the
+    # cube-root warp entirely — cheap, closed form, and a good Newton seed
+    # since the warp is a mild diffeomorphism away from black.
+    UU = (U * U).sum(-1); UV = (U * Wv).sum(-1); VV = (Wv * Wv).sum(-1)   # (F,)
+    det0 = UU * VV - UV * UV
+    diff = target_lin[:, None, :] - V0[None, :, :]                       # (M, F, 3)
+    Ud = (diff * U[None, :, :]).sum(-1)                                   # (M, F)
+    Vd = (diff * Wv[None, :, :]).sum(-1)
+    a = (VV[None, :] * Ud - UV[None, :] * Vd) / det0[None, :]
+    b = (UU[None, :] * Vd - UV[None, :] * Ud) / det0[None, :]
+    a, b = _simplex_clip_ab(a, b)
+
+    for _ in range(n_iters):
+        l  = mx.maximum(L0[None, :, :] + a[:, :, None] * P[None, :, :]
+                                        + b[:, :, None] * Q[None, :, :], eps_l)  # (M, F, 3)
+        w  = 1.0 / (3.0 * l ** (2.0 / 3.0))
+        X  = (l ** (1.0 / 3.0)) @ Bm.T                                    # (M, F, 3)
+        Xa = (w * P[None, :, :]) @ Bm.T                                   # tangent d X / d a
+        Xb = (w * Q[None, :, :]) @ Bm.T                                   # tangent d X / d b
+
+        r  = X - target_ok[:, None, :]
+        E = (Xa * Xa).sum(-1); Fq = (Xa * Xb).sum(-1); G = (Xb * Xb).sum(-1)  # (M, F)
+        ga = (Xa * r).sum(-1); gb = (Xb * r).sum(-1)
+        Ed, Gd = E * (1.0 + lm_lambda), G * (1.0 + lm_lambda)   # LM diagonal damping
+        det = Ed * Gd - Fq * Fq
+
+        a = a - (Gd * ga - Fq * gb) / det
+        b = b - (Ed * gb - Fq * ga) / det
+        a, b = _simplex_clip_ab(a, b)
+
+    l = mx.maximum(L0[None, :, :] + a[:, :, None] * P[None, :, :]
+                                   + b[:, :, None] * Q[None, :, :], eps_l)
+    X = (l ** (1.0 / 3.0)) @ Bm.T
+    dist = ((X - target_ok[:, None, :]) ** 2).sum(-1)                     # (M, F)
+    best = mx.argmin(dist, axis=-1)                                       # (M,)
+
+    color = V0[None, :, :] + a[:, :, None] * U[None, :, :] + b[:, :, None] * Wv[None, :, :]
+    onehot = (mx.arange(Fc)[None, :] == best[:, None]).astype(mx.float32)
+    return (color * onehot[:, :, None]).sum(1)                            # (M, 3)
+
+
+def _mix_strip_additive(strip_lin, hull_eqs, geom_mx):
+    """Clamp out-of-hull pixels onto the palette's convex hull in linear
+    RGB (_project — a coarse hull-membership fallback), then replace that
+    with the Oklab-nearest point on the hull surface found per facet by
+    _face_newton_closest. Pixels already inside the hull are untouched.
 
     strip_lin : (M, 3) float32 — pixel values in linear RGB (R, G, B).
     hull_eqs  : (F, 4) float32 — half-space equations in linear RGB space.
+    geom_mx   : dict from _face_geometry, already converted to MLX arrays.
     Returns   : (M, 3) float32 — optimised linear RGB values.
     """
     import mlx.core as mx
@@ -769,93 +1007,40 @@ def _mix_strip_additive(strip_lin, hull_eqs, max_iters=300, lr=0.02, tol=1e-6,
 
     target    = mx.array(strip_lin[rem])
     target_ok = _oklab(target)
-    color     = _project(target)
-    mx.eval(target_ok, color)
-    baseline_color = color   # naive hull-clamp, before any gradient descent
+    baseline_color = _project(target)   # naive hull-clamp, before refinement
+    mx.eval(target_ok, baseline_color)
 
-    L_target = target_ok[:, 0]
-    a_target = target_ok[:, 1]
-    b_target = target_ok[:, 2]
-    mx.eval(L_target, a_target, b_target)
+    refined = _face_newton_closest(target, target_ok, geom_mx)
+    mx.eval(refined)
 
-    def _run_phase(loss_fn, c, phase_label):
-        """Adam, projecting the candidate onto the hull after every step —
-        so the effective, gamut-clamped step is (projected_candidate - c)
-        rather than the raw Adam update. Adam's per-coordinate adaptivity is
-        needed here: phase 2 combines a primary term with a 1000x penalty
-        term, and that ill-conditioning stalls plain gradient descent.
-
-        Gradients are norm-clipped before feeding Adam's moment estimates.
-        Near black, Oklab's cube root has a very steep (though finite) slope,
-        so a pixel whose trajectory passes close to (0,0,0) can produce one
-        enormous gradient. Left unclipped, that single step dominates the
-        exponential moving averages — especially the slowly-decaying second
-        moment (beta2=0.999) — for dozens of subsequent steps, during which
-        Adam keeps moving in the wrong direction."""
-        lag       = mx.value_and_grad(loss_fn)
-        b1, b2, eps_a = 0.9, 0.999, 1e-8
-        max_grad_norm = 20.0
-        m_a       = mx.zeros(c.shape)
-        v_a       = mx.zeros(c.shape)
-        prev      = float('inf')
-        for step in range(1, max_iters + 1):
-            val, grad = lag(c)
-            grad_norm = mx.sqrt((grad * grad).sum(axis=-1, keepdims=True) + 1e-12)
-            grad = grad * mx.minimum(1.0, max_grad_norm / grad_norm)
-            m_a = b1 * m_a + (1.0 - b1) * grad
-            v_a = b2 * v_a + (1.0 - b2) * grad * grad
-            update = (m_a / (1.0 - b1 ** step)) / (mx.sqrt(v_a / (1.0 - b2 ** step)) + eps_a)
-            c      = _project(c - lr * update)
-            mx.eval(c, m_a, v_a, val)
-            curr = float(val)
-            if progress_label is not None and (step % 10 == 0 or step == max_iters):
-                print(f"\r  [mix] {progress_label} {phase_label} step {step:4d}/{max_iters} "
-                      f"loss={curr:.6f}   ", end="", file=sys.stderr, flush=True)
-            if abs(curr - prev) < tol:
-                break
-            prev = curr
-        if progress_label is not None:
-            print(file=sys.stderr, flush=True)
-        return c
-
-    # Phase 1: match luminance
-    color = _run_phase(lambda c: ((_oklab(c)[:, 0] - L_target) ** 2).mean(), color, "L")
-
-    # Phase 2: match chrominance (a, b jointly — hue and chroma together), preserve luminance
-    def _loss_ab(c):
-        lab = _oklab(c)
-        return ((lab[:, 1] - a_target) ** 2 + (lab[:, 2] - b_target) ** 2).mean() \
-             + 1000.0 * ((lab[:, 0] - L_target) ** 2).mean()
-    color = _run_phase(_loss_ab, color, "ab")
-
-    # Safety net: the two-phase optimisation should only ever improve on the
-    # naive hull-clamp, but near black Oklab's cube root is steep enough that
-    # occasional pixels can diverge instead (see module docs / BACKGROUND.md).
-    # Never let optimisation leave a pixel worse off than simply clamping it.
-    optimised_dist = ((_oklab(color) - target_ok) ** 2).sum(axis=-1)
-    baseline_dist  = ((_oklab(baseline_color) - target_ok) ** 2).sum(axis=-1)
-    color = mx.where((optimised_dist > baseline_dist)[:, None], baseline_color, color)
+    # Safety net: the facet-surface search should only ever improve on the
+    # naive hull-clamp, but near black Oklab's cube root is steep enough
+    # that a pixel very close to (0,0,0) could in principle land worse.
+    # Never let it leave a pixel worse off than simply clamping it.
+    refined_dist  = ((_oklab(refined) - target_ok) ** 2).sum(axis=-1)
+    baseline_dist = ((_oklab(baseline_color) - target_ok) ** 2).sum(axis=-1)
+    color = mx.where((refined_dist > baseline_dist)[:, None], baseline_color, refined)
     mx.eval(color)
 
     out[rem] = np.array(color)
     return out
 
 
-def mix_convert_additive(image, strip_h=256, max_iters=300, lr=0.02):
+def mix_convert_additive(image, palette_name=None, strip_h=256):
     """Additive (linear-light) palette mixing: convex hull in linear RGB.
 
-    Pixels are clamped onto the palette's convex hull in linear RGB, then
-    walked back toward their original colour in Oklab space via projected
-    gradient descent (see _mix_strip_additive). Pixels already inside the
-    hull are left unchanged.
+    Out-of-hull pixels are moved to the Oklab-nearest point on the
+    palette's convex hull surface in linear RGB (see _mix_strip_additive /
+    _face_newton_closest). Pixels already inside the hull are left
+    unchanged. palette_name: key into PALETTES (default DEFAULT_PALETTE/Nord).
     """
     try:
-        import mlx.core  # noqa: F401
+        import mlx.core as mx
     except ImportError:
         print("Error: --mix additive requires MLX (pip install mlx)", file=sys.stderr)
         sys.exit(1)
 
-    pal_bgr = np.array(PALETTE_BGR, dtype=np.float32) / 255.0  # (P, 3) sRGB
+    pal_bgr = np.array(_palette_bgr(palette_name), dtype=np.float32) / 255.0  # (P, 3) sRGB
     pal_lin = np.stack([
         _srgb_to_linear(pal_bgr[:, 2]),
         _srgb_to_linear(pal_bgr[:, 1]),
@@ -864,8 +1049,12 @@ def mix_convert_additive(image, strip_h=256, max_iters=300, lr=0.02):
 
     black = np.zeros((1, 3), dtype=np.float32)
     white = np.ones((1, 3),  dtype=np.float32)
-    pal_ext  = np.vstack([pal_lin, black, white])
-    hull_eqs = _halfspace_eqs(pal_ext)                          # (F, 4) — computed once
+    pal_ext = np.vstack([pal_lin, black, white])
+    hull_eqs, hull_tris = _halfspace_eqs(pal_ext)                # computed once
+
+    geom    = _face_geometry(pal_ext, hull_tris)
+    geom_mx = {k: mx.array(v) for k, v in geom.items()}
+    geom_mx['B'] = mx.array(_M_LMS_TO_OKLAB.astype(np.float32))
 
     img_f   = image.astype(np.float32) / 255.0
     rows, cols = img_f.shape[:2]
@@ -881,9 +1070,10 @@ def mix_convert_additive(image, strip_h=256, max_iters=300, lr=0.02):
     for si, r0 in enumerate(range(0, rows, strip_h)):
         r1    = min(r0 + strip_h, rows)
         strip = img_lin[r0:r1].reshape(-1, 3)
-        out   = _mix_strip_additive(strip, hull_eqs, max_iters=max_iters, lr=lr,
-                                    progress_label=f"strip {si + 1}/{n_strips}")
+        out   = _mix_strip_additive(strip, hull_eqs, geom_mx)
         out_lin[r0:r1] = out.reshape(r1 - r0, cols, 3)
+        print(f"\r  [mix] strip {si + 1}/{n_strips}", end="", file=sys.stderr, flush=True)
+    print(file=sys.stderr, flush=True)
 
     bgr = np.stack([
         np.clip(_linear_to_srgb(out_lin[:, :, 2]), 0.0, 1.0),  # B
@@ -932,6 +1122,7 @@ def _dog_light_peaks(L, sigmas=(2.5, 4.0, 6.0, 10.0, 16.0, 24.0), threshold=0.12
     clearly separated from scattered lower-magnitude peaks running along
     painted silhouette edges and canvas-texture brushwork.
     """
+    import cv2
     blurred = [cv2.GaussianBlur(L, (0, 0), s) for s in sigmas]
     dogs = [blurred[i] - blurred[i + 1] for i in range(len(sigmas) - 1)]
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
@@ -984,34 +1175,52 @@ def _light_protection_map(shape, peaks, spread=1.5, strength_scale=3.0):
     return np.clip(protect, 0.0, 1.0)
 
 
-def _nighttime(image, light_boost=0.2):
-    """Darken and cool: L→1-√(1-L), b shifted toward blue inversely
-    proportional to L — except at detected light peaks (`_dog_light_peaks`,
-    a lit window, a streetlight, the moon), which are protected from both
-    effects and additionally brightened by `light_boost`, feathered by
-    `_light_protection_map`.
+def _nighttime(image, amount=1.0, light_boost=0.2):
+    """Darken and cool: L→1-(1-L)^p(amount), b shifted toward blue by an
+    inverse-proportional-to-L power q(amount) — except at detected light
+    peaks (`_dog_light_peaks`, a lit window, a streetlight, the moon),
+    which are protected from both effects and additionally brightened by
+    `light_boost`, feathered by `_light_protection_map`.
+
+    `amount` is a continuous, reversible knob in [-1, 1], not a boolean:
+    +1 is the original night effect (p=0.5, i.e. L→1-√(1-L); q=2, i.e.
+    the previous fixed `b_norm*(L + b_norm*(1-L))`); 0 leaves the image
+    unchanged (p=q=1); -1 is the algebraic mirror, an "extreme day" push
+    (p=2, i.e. L→1-(1-L)²; q=0.5) that brightens and warms exactly where
+    the night direction would have darkened and cooled most (the
+    shadows), with light-peak protection faded out entirely on that side
+    — there's nothing to protect a peak *from* when brightening. p and q
+    are reciprocal powers of 2 in `amount` (p=2^-amount, q=2^amount) so
+    the whole range is one continuous family, not a crossfade between
+    two different formulas.
     """
     lab = _bgr_to_oklab(image.astype(np.float32) / 255.0)
     L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
     L = np.clip(L, 0.0, 1.0)
 
-    peaks = _dog_light_peaks(L)
-    protect = _light_protection_map(L.shape, peaks)
+    night_strength = max(0.0, amount)
+    if night_strength > 0.0:
+        peaks = _dog_light_peaks(L)
+        protect = _light_protection_map(L.shape, peaks) * night_strength
+    else:
+        protect = np.zeros_like(L)
+
+    p = 2.0 ** (-amount)
+    q = 2.0 ** amount
 
     b_min, b_max = float(b.min()), float(b.max())
     if b_max - b_min > 1e-6:
-        b_norm = (b - b_min) / (b_max - b_min)   # 0 = most blue, 1 = most yellow
-        # dark pixels (low L) get full squaring; bright pixels (L→1) get no shift
-        b_norm_new = b_norm * (L + b_norm * (1.0 - L))
-        b_dark = b_norm_new * (b_max - b_min) + b_min
+        b_norm = np.clip((b - b_min) / (b_max - b_min), 0.0, 1.0)   # 0 = most blue, 1 = most yellow
+        b_norm_new = L * b_norm + (1.0 - L) * b_norm ** q
+        b_shifted = b_norm_new * (b_max - b_min) + b_min
     else:
-        b_dark = b
+        b_shifted = b
 
-    L_dark = 1.0 - np.sqrt(1.0 - L)
+    L_shifted = 1.0 - np.clip(1.0 - L, 0.0, 1.0) ** p
     L_lit = np.clip(L + light_boost * protect, 0.0, 1.0)
 
-    L_new = L_dark * (1.0 - protect) + L_lit * protect
-    b_new = b_dark * (1.0 - protect) + b * protect
+    L_new = L_shifted * (1.0 - protect) + L_lit * protect
+    b_new = b_shifted * (1.0 - protect) + b * protect
 
     out_lab = np.stack([L_new, a, b_new], axis=-1)
     return np.clip(_oklab_to_bgr(out_lab) * 255.0, 0, 255).astype(np.uint8)
@@ -1049,22 +1258,27 @@ def convert(image, palette, dither=None):
 
 
 def main():
+    import cv2
     parser = argparse.ArgumentParser(
-        description="Convert an image to the Nord colour palette via Oklab snapping."
+        description="Convert an image to a fixed colour palette via Oklab snapping."
     )
     parser.add_argument("input", help="Input image path")
     parser.add_argument("-o", "--output", required=True, help="Output image path")
+    parser.add_argument("--palette", default=DEFAULT_PALETTE, choices=sorted(PALETTES),
+                        help=f"Colour palette to convert to (default: {DEFAULT_PALETTE}).")
     parser.add_argument("--dither", choices=["fs"],
                         help="Dithering: 'fs' (Floyd-Steinberg with blue noise)")
     parser.add_argument("--mix", nargs="?", const="spectral", choices=["spectral", "additive"],
                         help="Palette mixing (requires MLX; ignores --dither). "
                              "'spectral' (default): optimise simplex weights over "
                              "Gaussian-reflectance Kubelka-Munk palette spectra. "
-                             "'additive': clamp to the palette's convex hull in linear RGB, "
-                             "then nudge back toward the original colour in Oklab space via "
-                             "gamut-projected gradient descent.")
-    parser.add_argument("--night", action="store_true",
-                        help="Nighttime preprocessing: darken (L→L²) and cool (b shifted toward blue)")
+                             "'additive': move out-of-gamut pixels to the Oklab-nearest "
+                             "point on the palette's convex hull in linear RGB, via "
+                             "per-facet Gauss-Newton.")
+    parser.add_argument("--night", nargs="?", type=float, const=1.0, default=None, metavar="AMOUNT",
+                        help="Nighttime preprocessing, continuous in [-1, 1] (default 1.0 if given "
+                             "with no value): +1 darkens/cools fully, 0 leaves the image unchanged, "
+                             "-1 mirrors into an 'extreme day' brighten/warm push.")
     args = parser.parse_args()
 
     image = cv2.imread(args.input)
@@ -1072,15 +1286,15 @@ def main():
         print(f"Error: cannot read image '{args.input}'", file=sys.stderr)
         sys.exit(1)
 
-    if args.night:
-        image = _nighttime(image)
+    if args.night is not None:
+        image = _nighttime(image, amount=args.night)
 
     if args.mix == "spectral":
-        result = mix_convert_spectral(image)
+        result = mix_convert_spectral(image, palette_name=args.palette)
     elif args.mix == "additive":
-        result = mix_convert_additive(image)
+        result = mix_convert_additive(image, palette_name=args.palette)
     else:
-        palette = build_lookup()
+        palette = build_lookup(_palette_bgr(args.palette))
         result = convert(image, palette, dither=args.dither)
 
     ok = cv2.imwrite(args.output, result)

@@ -1,0 +1,31 @@
+<!doctype html>
+<html>
+<head><title>test harness</title></head>
+<body style="margin:0">
+<canvas id="c" width="256" height="256"></canvas>
+<div id="status">not started</div>
+<script type="module">
+import { WallpaperPipeline } from './wallpaper.js';
+import { NightPipeline } from './night.js';
+import { AdditivePipeline, SubtractivePipeline } from './palettize.js';
+import { PALETTE_GEOMETRY } from './palette_data.js';
+import { createTextureU8, createTextureF, createProgram, createEmptyVao, runFullscreen, readFramebufferRGBA, createFramebuffer } from './gl-utils.js';
+import { FULLSCREEN_VERT } from './shaders.js';
+
+window.TEST = { WallpaperPipeline, NightPipeline, AdditivePipeline, SubtractivePipeline,
+                PALETTE_GEOMETRY,
+                createTextureU8, createTextureF, createProgram, createEmptyVao, runFullscreen,
+                readFramebufferRGBA, createFramebuffer, FULLSCREEN_VERT };
+
+const canvas = document.getElementById('c');
+window.canvas = canvas;
+window.gl = canvas.getContext('webgl2');
+if (!window.gl) {
+  document.getElementById('status').textContent = 'NO WEBGL2';
+} else {
+  const ext = window.gl.getExtension('EXT_color_buffer_float');
+  document.getElementById('status').textContent = ext ? 'ready' : 'NO EXT_color_buffer_float';
+}
+</script>
+</body>
+</html>

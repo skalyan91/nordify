@@ -8,3 +8,7 @@ __pycache__/
 /*.png
 /*.jpg
 /*.jpeg
+
+# Callide power station photo/depth/segmentation -- used as a real-photo
+# validation fixture but not ours to redistribute.
+samples/callide_*.png

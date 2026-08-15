@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Wallricer</title>
+<style>
+  body { font: 14px/1.4 -apple-system, BlinkMacSystemFont, sans-serif; margin: 0; display: flex; height: 100vh; }
+  #sidebar { width: 320px; flex: none; padding: 16px; box-sizing: border-box; overflow-y: auto; background: #f4f4f4; border-right: 1px solid #ccc; }
+  #main { flex: 1; display: flex; align-items: center; justify-content: center; background: #222; overflow: auto; }
+  canvas { max-width: 100%; max-height: 100%; cursor: crosshair; background: #000; }
+  fieldset { margin: 0 0 14px; border: 1px solid #ccc; border-radius: 6px; }
+  legend { font-weight: 600; padding: 0 4px; }
+  label { display: block; margin: 8px 0 2px; font-size: 12px; color: #444; }
+  input[type=file] { width: 100%; font-size: 12px; }
+  input[type=number] { width: 70px; }
+  input[type=range] { width: 100%; }
+  button { width: 100%; padding: 8px; margin-top: 6px; cursor: pointer; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  #status { font-size: 12px; color: #555; margin-top: 8px; white-space: pre-wrap; }
+  #status.error { color: #b00; font-weight: 600; }
+  .hint { font-size: 11px; color: #888; }
+  fieldset:disabled { opacity: 0.5; }
+  input:disabled, select:disabled { opacity: 0.5; }
+</style>
+</head>
+<body>
+<div id="sidebar">
+  <h2 style="margin-top:0">Wallpaper Ricer <span class="hint">(Wallricer)</span></h2>
+  <p class="hint">
+    Turns a photo into a wallpaper: crops it to the size you want, softly blurs the
+    background the way a camera lens would, and recolours everything to match a palette
+    like Nord or Gruvbox. Blurring and cropping around the subject need a sense of depth —
+    upload a depth map below, or let your browser work it out automatically. See
+    <a href="README.md">README.md</a> for the technical details.
+  </p>
+
+  <fieldset>
+    <legend>1. Upload</legend>
+    <label for="imageFile">Image</label>
+    <input type="file" id="imageFile" accept="image/*">
+    <label><input type="checkbox" id="autoDepthEnabled"> Figure out depth &amp; focus automatically (in your browser)</label>
+    <p class="hint">Downloads two AI models the first time — roughly 70&ndash;100MB total. Your
+      browser keeps them cached after that, and your photo is never sent anywhere; everything
+      runs on your own device. The depth model looks at your photo in close-up passes as well
+      as all at once, to catch fine detail a single pass would miss — thorough, but slow: a
+      few seconds for a small photo, several minutes for a large one (about 5 minutes on a
+      1600&times;821 photo in testing).</p>
+    <label for="depthFile">Depth map (grayscale; brighter = closer) — optional, enables focus/blur</label>
+    <input type="file" id="depthFile" accept="image/*">
+    <label for="segFile">Segmentation map (grayscale; pixel value = region ID, 0 = background) — optional, enables figure-aware cropping</label>
+    <input type="file" id="segFile" accept="image/*">
+    <div class="row" style="margin-top:8px">
+      <div>
+        <label for="targetW" style="margin:0">Target W (px)</label>
+        <input type="number" id="targetW" value="960" min="1">
+      </div>
+      <div>
+        <label for="aspectRatio" style="margin:0">Aspect (W:H)</label>
+        <input type="text" id="aspectRatio" value="16:9" pattern="\d+(\.\d+)?\s*:\s*\d+(\.\d+)?" style="width:70px">
+      </div>
+      <div>
+        <label for="kLayers" style="margin:0">K layers</label>
+        <input type="number" id="kLayers" value="8" min="1" max="8">
+      </div>
+    </div>
+    <button id="loadBtn">Load &amp; run</button>
+    <div id="status">Choose an image to begin (depth map + segmentation map are optional).</div>
+  </fieldset>
+
+  <fieldset>
+    <legend>2. Filters (before cropping, live)</legend>
+    <label><input type="checkbox" id="nightEnabled"> Night colouring</label>
+    <label for="nightAmount" class="hint">Amount: &minus;1 extreme day &hellip; 0 unchanged &hellip; +1 full night</label>
+    <input type="range" id="nightAmount" min="-1" max="1" step="0.02" value="1">
+    <label><input type="checkbox" id="mixEnabled"> Palette mixing</label>
+    <label for="paletteSelect" class="hint">Colour scheme</label>
+    <select id="paletteSelect">
+      <option value="nord" selected>Nord</option>
+      <option value="solarized-dark">Solarized Dark</option>
+      <option value="gruvbox-dark">Gruvbox Dark</option>
+      <option value="everforest-dark">Everforest Dark</option>
+      <option value="catppuccin-mocha">Catppuccin Mocha</option>
+      <option value="dracula">Dracula</option>
+    </select>
+    <label for="mixMode" class="hint">Mode</label>
+    <select id="mixMode">
+      <option value="additive">Additive (light mixing)</option>
+      <option value="subtractive">Subtractive (Kubelka-Munk)</option>
+    </select>
+    <p class="hint">Applied to the original source image (never to the crop/focus decisions above)
+      — a few ms per change, live enough to drag the night-amount slider directly. Every
+      colour scheme's shaders are precompiled at page load, so switching applies instantly.</p>
+  </fieldset>
+
+  <fieldset id="focusFieldset">
+    <legend>3. Focus (live)</legend>
+    <label><input type="checkbox" id="focalAuto" checked> Auto (figure's own median depth)</label>
+    <label for="focalDepth">Focal depth</label>
+    <input type="range" id="focalDepth" min="0" max="1" step="0.01" value="0.5">
+    <label for="sigmaMax">Max blur radius (sigma_max, px)</label>
+    <input type="number" id="sigmaMax" value="10" min="0" step="1">
+    <p class="hint">Click the image to focus at that point's own depth. Needs a depth map and
+      segmentation map (see Upload above).</p>
+  </fieldset>
+
+  <fieldset>
+    <legend>4. Export</legend>
+    <button id="downloadBtn">Download PNG</button>
+    <button id="downloadShadersBtn">Download shaders (.zip)</button>
+    <p class="hint">Only whichever of crop/focus, night colouring, and palette mixing are
+      currently active — compiled specifically for the selected palette.</p>
+  </fieldset>
+</div>
+
+<div id="main">
+  <canvas id="canvas" width="960" height="540"></canvas>
+</div>
+<script type="module" src="demo.js"></script>
+</body>
+</html>

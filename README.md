@@ -1,6 +1,6 @@
-# nordify
+# Wallpaper Ricer
 
-Convert any image to the [Nord colour palette](https://www.nordtheme.com/). Colour snapping and dithering operate in the perceptually-uniform [Oklab](https://bottosson.github.io/posts/oklab/) colour space; palette mixing maps pixels onto a convex hull whose geometry varies by mixing model (spectral Kubelka-Munk pigment mixing, or linear-RGB additive light mixing).
+Convert any image to a fixed colour scheme — [Nord](https://www.nordtheme.com/), [Solarized](https://ethanschoonover.com/solarized/), [Gruvbox](https://github.com/morhetz/gruvbox), [Everforest](https://github.com/sainnhe/everforest), [Catppuccin](https://github.com/catppuccin/catppuccin), [Dracula](https://draculatheme.com/), or any other palette added to `palettize.py`'s `PALETTES`. Colour snapping and dithering operate in the perceptually-uniform [Oklab](https://bottosson.github.io/posts/oklab/) colour space; palette mixing maps pixels onto a convex hull whose geometry varies by mixing model (spectral Kubelka-Munk pigment mixing, or linear-RGB additive light mixing) and is refit per palette.
 
 ## Installation
 
@@ -22,7 +22,7 @@ pip install mlx                        # --mix (Apple Silicon required)
 The pipeline is two scripts run in sequence:
 
 ```
-depth_blur.py  →  nordify.py
+depth_blur.py  →  palettize.py
 (crop + blur)     (palette conversion)
 ```
 
@@ -49,19 +49,20 @@ python3 depth_blur.py <input> -o <blurred> [options]
 | `--flatten-masts` | — | Flatten thin, tall, solid vertical structures (chimneys, masts) to their own median depth; see [Methods](#mast-depth-flattening---flatten-masts) below |
 | `--model MODEL` | Depth Anything V2 Small | HuggingFace depth model ID |
 
-### Step 2 — `nordify.py`
+### Step 2 — `palettize.py`
 
-Maps every pixel to a Nord colour. Optionally applies a nighttime pre-processing pass before conversion.
+Maps every pixel to a colour from the chosen palette. Optionally applies a nighttime pre-processing pass before conversion.
 
 ```
-python3 nordify.py <input> -o <output> [options]
+python3 palettize.py <input> -o <output> [options]
 ```
 
-| Flag | Description |
-|------|-------------|
-| `--dither fs` | Floyd-Steinberg dithering with blue-noise seeding |
-| `--mix [spectral\|additive]` | Palette mixing (requires MLX); see [Methods](#palette-mixing---mix) below. |
-| `--night` | Nighttime pre-processing: darken and cool the image before palette conversion |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--palette NAME` | `nord` | Colour scheme to convert to — see [Palettes](#palettes) below for the full list |
+| `--dither fs` | — | Floyd-Steinberg dithering with blue-noise seeding |
+| `--mix [spectral\|additive]` | — | Palette mixing (requires MLX); see [Methods](#palette-mixing---mix) below. |
+| `--night` | — | Nighttime pre-processing: darken and cool the image before palette conversion |
 
 ### Utility — `entropy_crop.py`
 
@@ -81,34 +82,37 @@ The edge source is only used to choose the crop offset — it is not implicitly 
 ### Examples
 
 ```bash
-# Plain colour snapping
-python3 nordify.py photo.jpg -o photo_nord.png
+# Plain colour snapping (Nord, the default)
+python3 palettize.py photo.jpg -o photo_nord.png
+
+# A different scheme
+python3 palettize.py photo.jpg -o photo_gruvbox.png --palette gruvbox-dark
 
 # Floyd-Steinberg dithering
-python3 nordify.py photo.jpg -o photo_nord.png --dither fs
+python3 palettize.py photo.jpg -o photo_nord.png --dither fs
 
 # Spectral palette mixing
-python3 nordify.py photo.jpg -o photo_nord.png --mix
+python3 palettize.py photo.jpg -o photo_nord.png --mix
 
 # Additive (linear-light) palette mixing
-python3 nordify.py photo.jpg -o photo_nord.png --mix additive
+python3 palettize.py photo.jpg -o photo_nord.png --mix additive
 
 # Nighttime version with spectral mixing
-python3 nordify.py photo.jpg -o photo_night.png --night --mix
+python3 palettize.py photo.jpg -o photo_night.png --night --mix
 
-# Full wallpaper pipeline: 16:9 crop + depth blur, then nordify
+# Full wallpaper pipeline: 16:9 crop + depth blur, then palettize
 python3 depth_blur.py photo.jpg -o blurred.png
-python3 nordify.py blurred.png -o wallpaper.png --mix
+python3 palettize.py blurred.png -o wallpaper.png --mix
 
-# 3:2 wallpaper, keeping left side, heavier blur
+# 3:2 wallpaper, keeping left side, heavier blur, Catppuccin Mocha
 python3 depth_blur.py photo.jpg -o blurred.png --aspect 3:2 --align left --blur 4
-python3 nordify.py blurred.png -o wallpaper.png --mix
+python3 palettize.py blurred.png -o wallpaper.png --mix --palette catppuccin-mocha
 
 # Derive a 3:2 crop from an already-finished 16:9 wallpaper (and its night
 # variant) via minimum-entropy cropping against the depth map, keeping both
 # pixel-aligned
 python3 depth_blur.py photo.jpg -o blurred.png --no-crop --save-depth depth.png
-python3 nordify.py blurred.png -o wallpaper.png --mix
+python3 palettize.py blurred.png -o wallpaper.png --mix
 python3 entropy_crop.py depth.png --aspect 3:2 \
     wallpaper.png wallpaper_3x2.png \
     wallpaper_night.png wallpaper_night_3x2.png
@@ -131,7 +135,7 @@ Original photo by [Philippe Gauthier](https://unsplash.com/photos/orange-fruits-
 |---|---|
 | ![Mixed spectral](samples/mixed.png) | ![Mixed additive](samples/mixed_additive.png) |
 
-**Wallpaper crop + depth-guided defocus blur + additive palette mixing (`depth_blur.py` → `nordify.py --mix additive`):**
+**Wallpaper crop + depth-guided defocus blur + additive palette mixing (`depth_blur.py` → `palettize.py --mix additive`):**
 
 ![Wallpaper](samples/wallpaper.png)
 
@@ -158,7 +162,7 @@ The pipeline:
 3. **Spatial blur** — weights are Gaussian-smoothed across neighbours and re-projected, giving spatially coherent mixing in flat regions.
 4. **Adam optimisation** — cosine-decayed Adam refines the simplex weights per strip to minimise Oklab distance to the target.
 
-**`--mix additive`** treats the palette as a set of light sources instead of pigments: the reachable gamut is the convex hull of the 17 colours (plus black and white) in **linear RGB**, which — unlike the K/S spectral gamut — includes ordinary additive colour mixing. Out-of-gamut pixels are first clamped onto this hull, then walked back toward their original colour in Oklab space in two sequential phases — luminance, then chrominance (hue and chroma matched jointly) — each phase run with Adam. Every step's candidate is re-projected onto the hull, so the effective step is always the gradient clamped to the gamut boundary rather than a raw unconstrained step. Because the additive gamut is much larger than the pigment gamut, this model changes photographs more subtly than spectral mixing — visible mainly on strongly saturated or overexposed pixels.
+**`--mix additive`** treats the palette as a set of light sources instead of pigments: the reachable gamut is the convex hull of the 17 colours (plus black and white) in **linear RGB**, which — unlike the K/S spectral gamut — includes ordinary additive colour mixing. Out-of-gamut pixels are moved directly to the Oklab-nearest point on that hull's surface: each hull facet is a flat triangle in linear RGB that the cube root (on the way to Oklab) warps into a smooth curved surface, and the nearest point on it is found by a few Levenberg-Marquardt-damped Gauss-Newton steps in the triangle's own 2 parameters, clamped back onto the triangle after every step. Because the additive gamut is much larger than the pigment gamut, this model changes photographs more subtly than spectral mixing — visible mainly on strongly saturated or overexposed pixels.
 
 For a more detailed discussion of the algorithms and their artistic rationale, see [BACKGROUND.md](BACKGROUND.md).
 
@@ -170,7 +174,7 @@ Estimates monocular depth via [Depth Anything V2](https://github.com/DepthAnythi
 
 No longer needed by the default pipeline — Depth Anything V2 (the default model) doesn't make the mistake this corrects. Still available via `--fix-sky` for anyone using `--model apple/DepthPro-hf`.
 
-Depth Pro, trained on real photographs, can read a flat, desaturated, silhouette-like region as *near* — a strong learned cue for atmospheric haze in photos — even when it's the sky sitting behind a much nearer, plainly-painted structure. Confirmed on a power-station painting, where Depth Pro placed the sky nearer than the building in front of it while Depth Anything V2 got the same region right — an out-of-distribution failure specific to stylised/painted content, not a general flaw. `--fix-sky` corrects it: Depth Anything V2's map is Otsu-thresholded to locate the sky (its single farthest, most tightly-clustered region), then that region's Depth Anything values — least-squares fit to Depth Pro's scale using everything *outside* the sky mask, never the sky itself — are blended into the result through a feathered mask, with a safety clamp guaranteeing the corrected sky never reads nearer than the nearest non-sky pixel. This roughly doubles depth-estimation time (Depth Anything's tiled pass runs alongside Depth Pro's) but that's still small next to `nordify.py --mix`'s per-image runtime.
+Depth Pro, trained on real photographs, can read a flat, desaturated, silhouette-like region as *near* — a strong learned cue for atmospheric haze in photos — even when it's the sky sitting behind a much nearer, plainly-painted structure. Confirmed on a power-station painting, where Depth Pro placed the sky nearer than the building in front of it while Depth Anything V2 got the same region right — an out-of-distribution failure specific to stylised/painted content, not a general flaw. `--fix-sky` corrects it: Depth Anything V2's map is Otsu-thresholded to locate the sky (its single farthest, most tightly-clustered region), then that region's Depth Anything values — least-squares fit to Depth Pro's scale using everything *outside* the sky mask, never the sky itself — are blended into the result through a feathered mask, with a safety clamp guaranteeing the corrected sky never reads nearer than the nearest non-sky pixel. This roughly doubles depth-estimation time (Depth Anything's tiled pass runs alongside Depth Pro's) but that's still small next to `palettize.py --mix`'s per-image runtime.
 
 ### Mast depth flattening (`--flatten-masts`)
 
@@ -212,7 +216,11 @@ Transforms pixel colours in Oklab before palette conversion:
 - **Yellow/blue axis** — `b` is shifted toward blue in inverse proportion to luminance: dark pixels receive the full shift (warming tones become cool), bright pixels are left unchanged (artificial lights and highlights keep their original colour temperature).
 - **Detected lights** — a lit window or streetlight should stay bright at night, not just avoid being darkened, but picking it out from an ordinary bright or colourful pixel (a sunlit orange, a patch of sky) needs more than a per-pixel colour rule can see: what actually makes something read as "a light" is standing out sharply from its *immediate surroundings*, not any absolute brightness or colour value. Each compact spot substantially brighter than its own neighbourhood — at whatever spatial scale it happens to be, found via multi-scale Difference-of-Gaussians blob detection (the same core idea behind SIFT keypoints) on the lightness channel — is protected from both effects above and additionally brightened, feathered smoothly around each detected spot. No segmentation model or depth map needed: local contrast alone is exactly the signal that defines a light.
 
-## Nord Palette
+## Palettes
+
+Every scheme in `palettize.PALETTES` (`--palette NAME`), each with a pure black `#000000` prepended (extends the lightness range available to snapping and mixing alike — see `palettize.py`'s own comment on `PALETTES`):
+
+**`nord`** (default)
 
 | Group | Colours |
 |-------|---------|
@@ -220,6 +228,16 @@ Transforms pixel colours in Oklab before palette conversion:
 | Snow Storm | nord4 `#D8DEE9` · nord5 `#E5E9F0` · nord6 `#ECEFF4` |
 | Frost | nord7 `#8FBCBB` · nord8 `#88C0D0` · nord9 `#81A1C1` · nord10 `#5E81AC` |
 | Aurora | nord11 `#BF616A` · nord12 `#D08770` · nord13 `#EBCB8B` · nord14 `#A3BE8C` · nord15 `#B48EAD` |
+
+**`solarized-dark`** — base03`#002B36` base02`#073642` base01`#586E75` base00`#657B83` base0`#839496` base1`#93A1A1` base2`#EEE8D5` base3`#FDF6E3` · yellow`#B58900` orange`#CB4B16` red`#DC322F` magenta`#D33682` violet`#6C71C4` blue`#268BD2` cyan`#2AA198` green`#859900`
+
+**`gruvbox-dark`** — bg0`#282828` bg1`#3C3836` bg2`#504945` bg3`#665C54` bg4`#7C6F64` · fg0`#FBF1C7` fg1`#EBDBB2` fg2`#D5C4A1` fg3`#BDAE93` · red`#FB4934` green`#B8BB26` yellow`#FABD2F` blue`#83A598` purple`#D3869B` aqua`#8EC07C` orange`#FE8019`
+
+**`everforest-dark`** — bg0`#2D353B` bg1`#343F44` bg2`#3D484D` bg3`#475258` bg4`#4F585E` · fg`#D3C6AA` · red`#E67E80` orange`#E69875` yellow`#DBBC7F` green`#A7C080` aqua`#83C092` blue`#7FBBB3` purple`#D699B6` · grey0`#7A8478` grey1`#859289` grey2`#9DA9A0`
+
+**`catppuccin-mocha`** — base`#1E1E2E` mantle`#181825` crust`#11111B` · text`#CDD6F4` · rosewater`#F5E0DC` flamingo`#F2CDCD` pink`#F5C2E7` mauve`#CBA6F7` red`#F38BA8` maroon`#EBA0AC` peach`#FAB387` yellow`#F9E2AF` green`#A6E3A1` teal`#94E2D5` sky`#89DCEB` blue`#89B4FA`
+
+**`dracula`** — background`#282A36` current-line`#44475A` foreground`#F8F8F2` comment`#6272A4` · cyan`#8BE9FD` green`#50FA7B` orange`#FFB86C` pink`#FF79C6` purple`#BD93F9` red`#FF5555` yellow`#F1FA8C`
 
 ---
 

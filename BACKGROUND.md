@@ -18,7 +18,7 @@ Two derived quantities are useful throughout:
 - **Chroma** C = √(a² + b²) — how saturated the colour is
 - **Hue** H = arctan2(b, a) — the colour's position on the colour wheel
 
-All colour comparisons and optimisations in nordify run in Oklab.
+All colour comparisons and optimisations in palettize.py run in Oklab.
 
 ## Colour snapping
 
@@ -137,7 +137,7 @@ One consequence of the change: a parabola is a polynomial in position, so a weig
 
 ### What actually makes something read as "a light"
 
-`nordify.py --night` darkens and cools an image to suggest nighttime, but a real light source — a lit window, a streetlamp, the moon — should stay bright rather than dim along with everything else. The natural question, "is this pixel bright?", turns out to be the wrong one: a white shirt in daylight is bright, but so is everything around it, and it isn't "a light." What actually makes something read as a light source is standing out sharply from its *immediate surroundings* — local contrast, not any absolute brightness or colour value. That signal isn't visible to a rule operating on one pixel's own colour at a time; it requires looking at a neighbourhood.
+`palettize.py --night` darkens and cools an image to suggest nighttime, but a real light source — a lit window, a streetlamp, the moon — should stay bright rather than dim along with everything else. The natural question, "is this pixel bright?", turns out to be the wrong one: a white shirt in daylight is bright, but so is everything around it, and it isn't "a light." What actually makes something read as a light source is standing out sharply from its *immediate surroundings* — local contrast, not any absolute brightness or colour value. That signal isn't visible to a rule operating on one pixel's own colour at a time; it requires looking at a neighbourhood.
 
 ### Difference-of-Gaussians as a blob detector
 
